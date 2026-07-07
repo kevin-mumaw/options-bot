@@ -376,7 +376,9 @@ def generate_narrative(pos):
     elif pnl < 0:
         lines.append(f"Currently down ${pnl:+.2f}. Worth revisiting whether the original thesis for this trade still holds given the time remaining.")
 
-    return " ".join(lines)
+    # Escape $ so Streamlit's markdown renderer doesn't interpret pairs of dollar signs
+    # as LaTeX math delimiters (which was swallowing some of the currency amounts).
+    return " ".join(lines).replace("$", "\\$")
 
 def scan_single_ticker(ticker):
     """Pulls option chains via Tradier."""

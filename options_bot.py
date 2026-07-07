@@ -56,7 +56,7 @@ UNIVERSE = [
 MIN_AVG_VOLUME = 1_000_000   # avg daily shares traded -- proxy for tight bid/ask spreads
 MIN_PRICE = 10.0             # skip penny-priced noise
 
-def filter_liquid_universe(tickers, progress=print):
+def filter_liquid_universe(tickers):
     """Cuts the raw universe down to genuinely liquid names using Tradier's batch quote
     endpoint (a handful of calls for the whole universe), BEFORE spending option-chain
     calls on names that wouldn't qualify anyway. Real options IV/liquidity is still checked
@@ -82,18 +82,10 @@ def filter_liquid_universe(tickers, progress=print):
                 if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
                     liquid.append(q.get('symbol'))
         except Exception as e:
-            progress(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
+            print(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
     return liquid
 
 def load_portfolio():
-    # On Streamlit Cloud, real position data comes from a secret (never committed to the
-    # public repo). Locally, the CLI keeps reading portfolio.json as before.
-    inline_json = os.getenv("PORTFOLIO_JSON")
-    if inline_json:
-        try:
-            return json.loads(inline_json)
-        except Exception:
-            return None
     if not os.path.exists(PORTFOLIO_FILE): return None
     try:
         with open(PORTFOLIO_FILE, "r") as f: return json.load(f)
@@ -319,14 +311,14 @@ def format_setup_list(setups, header):
         section += f"{i}. [{setup['ticker'].upper()}] (Ratio: {setup['score']:.1f}:1, Est. EV: ${setup['ev']:+.2f})\n   {setup['desc']}\n\n"
     return section
 
-def run_bulk_screener(progress=print):
+def run_bulk_screener():
     all_setups = []
-    progress(f" [*] Universe: {len(UNIVERSE)} candidate tickers. Checking liquidity (price/volume)...")
-    liquid_tickers = filter_liquid_universe(UNIVERSE, progress=progress)
-    progress(f" [*] {len(liquid_tickers)} tickers passed the liquidity filter (avg volume >= {MIN_AVG_VOLUME:,}, price >= ${MIN_PRICE:.0f}).")
+    print(f" [*] Universe: {len(UNIVERSE)} candidate tickers. Checking liquidity (price/volume)...")
+    liquid_tickers = filter_liquid_universe(UNIVERSE)
+    print(f" [*] {len(liquid_tickers)} tickers passed the liquidity filter (avg volume >= {MIN_AVG_VOLUME:,}, price >= ${MIN_PRICE:.0f}).")
     if not liquid_tickers:
         return "No tickers passed the liquidity filter -- check your Tradier connection or thresholds."
-    progress(f" [*] Scanning {len(liquid_tickers)} liquid tickers for options setups via parallel multithreading pools...")
+    print(f" [*] Scanning {len(liquid_tickers)} liquid tickers for options setups via parallel multithreading pools...")
     with ThreadPoolExecutor(max_workers=15) as executor:
         results = executor.map(scan_single_ticker, liquid_tickers)
     for res_list in results:

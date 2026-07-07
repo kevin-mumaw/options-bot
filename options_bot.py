@@ -5,6 +5,7 @@ import json
 import os
 import math
 import time
+import csv
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -55,6 +56,35 @@ UNIVERSE = [
 
 MIN_AVG_VOLUME = 1_000_000   # avg daily shares traded -- proxy for tight bid/ask spreads
 MIN_PRICE = 10.0             # skip penny-priced noise
+
+BACKTEST_LOG_FILE = "backtest_log.csv"
+BACKTEST_LOG_COLUMNS = [
+    "run_date", "ticker", "type", "expiration", "spot_at_scan",
+    "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
+    "net_cost", "max_profit", "prob_profit", "ev",
+    "graded", "actual_spot_at_exp", "actual_payoff", "actual_pnl", "win"
+]
+
+def log_setups_to_csv(setups, log_file=BACKTEST_LOG_FILE):
+    """Appends every candidate setup found (not just the top 3 shown to the user) to a CSV,
+    so we can later check what actually happened at expiration and see whether this
+    tool's probability/EV estimates are calibrated to reality. Ungraded fields are left
+    blank until grade_backtest.py fills them in after expiration passes."""
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    file_exists = os.path.exists(log_file)
+    try:
+        with open(log_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=BACKTEST_LOG_COLUMNS)
+            if not file_exists:
+                writer.writeheader()
+            for s in setups:
+                row = {col: s.get(col, "") for col in BACKTEST_LOG_COLUMNS}
+                row["run_date"] = run_date
+                row["graded"] = "no"
+                writer.writerow(row)
+    except Exception as e:
+        print(f" [!] Couldn't write to {log_file}: {e}")
+
 
 def filter_liquid_universe(tickers, progress=print):
     """Cuts the raw universe down to genuinely liquid names using Tradier's batch quote
@@ -144,7 +174,6 @@ def prob_finish_above(spot, strike, iv, days_to_exp):
     T = days_to_exp / 365.0
     d2 = (math.log(spot / strike) - 0.5 * iv * iv * T) / (iv * math.sqrt(T))
     return 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
-
 def get_tradier_quote(symbol, headers):
     res = requests.get(f"{TRADIER_BASE_URL}/markets/quotes",
                         params={"symbols": symbol}, headers=headers, timeout=10).json()
@@ -219,7 +248,6 @@ def track_live_portfolio():
             except Exception as e:
                 report += f" [!] {spread.get('ticker', '?')}: {e}\n\n"
     return report
-
 def scan_single_ticker(ticker):
     """Pulls option chains via Tradier."""
     setups = []
@@ -298,6 +326,9 @@ def scan_single_ticker(ticker):
                     setups.append({
                         "ticker": ticker, "type": "Debit Vertical", "score": max_profit / net_debit,
                         "prob_profit": prob_profit, "ev": ev,
+                        "expiration": target_date, "spot_at_scan": spot,
+                        "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
+                        "net_cost": net_debit, "max_profit": max_profit,
                         "desc": f"BUY ${long_leg['strike']} C / SELL ${short_leg['strike']} C (Cost: ${net_debit:.2f} | Max Gain: ${max_profit:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                     })
                     
@@ -327,6 +358,9 @@ def scan_single_ticker(ticker):
                         setups.append({
                             "ticker": ticker, "type": "Butterfly Pin", "score": max_bfly_profit / net_cost,
                             "prob_profit": prob_profit, "ev": ev,
+                            "expiration": target_date, "spot_at_scan": spot,
+                            "low_strike": low_leg['strike'], "mid_strike": mid_leg['strike'], "high_strike": high_leg['strike'],
+                            "net_cost": net_cost, "max_profit": max_bfly_profit,
                             "desc": f"Pin Target ${mid_leg['strike']} (${low_leg['strike']}/{mid_leg['strike']}/{high_leg['strike']}) (Cost: ${net_cost:.2f} | Max Gain: ${max_bfly_profit:.2f}) | Exp: {target_date} | Est. Prob. in Profit Zone: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                         })
     except Exception as e:
@@ -365,6 +399,10 @@ def run_bulk_screener(progress=print):
         results = executor.map(scan_single_ticker, liquid_tickers)
     for res_list in results:
         if res_list: all_setups.extend(res_list)
+
+    if all_setups:
+        log_setups_to_csv(all_setups)
+        progress(f" [*] Logged {len(all_setups)} candidate setups to {BACKTEST_LOG_FILE} for future grading.")
 
     verticals = [s for s in all_setups if s['type'] == 'Debit Vertical' and s['ev'] > 0]
     butterflies = [s for s in all_setups if s['type'] == 'Butterfly Pin' and s['ev'] > 0]

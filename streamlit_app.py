@@ -46,10 +46,27 @@ with tab_screener:
         st.caption("EV estimates use a simplified Black-Scholes probability model. Not a guarantee -- verify in your broker before trading.")
 
 with tab_portfolio:
-    st.caption("Reads portfolio.json committed to this repo. To update it, log a trade with log_trade.py on your desktop, then push to GitHub.")
+    st.caption("Reads live positions from the PORTFOLIO_JSON secret. To update it, log a trade with log_trade.py on your desktop, then update the secret in this app's settings.")
     if st.button("Refresh Portfolio", type="primary", use_container_width=True):
         with st.spinner("Pulling live prices..."):
-            report_text = bot.track_live_portfolio()
-        st.code(report_text, language=None)
+            status = bot.get_portfolio_status()
+
+        if status.get("error"):
+            st.error(status["error"])
+        elif not status.get("positions"):
+            st.info("No open positions found.")
+        else:
+            for pos in status["positions"]:
+                with st.container(border=True):
+                    st.markdown(f"**{pos['ticker']}** -- {pos['type']}")
+                    if pos.get("error"):
+                        st.warning(pos["error"])
+                        continue
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Spot", f"${pos['spot']:.2f}")
+                    col2.metric("P/L", f"${pos['pnl']:+.2f}")
+                    col3.metric("Days to Exp", pos["days_to_exp"])
+                    st.caption(bot.generate_narrative(pos))
+            st.caption("General educational context only, not personalized trading advice -- always verify against your own broker and judgment before acting.")
     else:
-        st.info("Tap 'Refresh Portfolio' to pull current prices and P/L.")
+        st.info("Tap 'Refresh Portfolio' to pull current prices, P/L, and a plain-language summary of each position.")

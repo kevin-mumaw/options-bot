@@ -1,0 +1,7 @@
+﻿.env
+__pycache__/
+*.pyc
+venv/
+.streamlit/secrets.toml
+portfolio_backup.json
+portfolio.json

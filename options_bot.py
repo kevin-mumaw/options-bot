@@ -1,4 +1,4 @@
-import yfinance as yf
+﻿import yfinance as yf
 import pandas as pd
 import requests
 import json
@@ -56,7 +56,7 @@ UNIVERSE = [
 MIN_AVG_VOLUME = 1_000_000   # avg daily shares traded -- proxy for tight bid/ask spreads
 MIN_PRICE = 10.0             # skip penny-priced noise
 
-def filter_liquid_universe(tickers):
+def filter_liquid_universe(tickers, progress=print):
     """Cuts the raw universe down to genuinely liquid names using Tradier's batch quote
     endpoint (a handful of calls for the whole universe), BEFORE spending option-chain
     calls on names that wouldn't qualify anyway. Real options IV/liquidity is still checked
@@ -82,10 +82,18 @@ def filter_liquid_universe(tickers):
                 if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
                     liquid.append(q.get('symbol'))
         except Exception as e:
-            print(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
+            progress(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
     return liquid
 
 def load_portfolio():
+    # On Streamlit Cloud, real position data comes from a secret (never committed to the
+    # public repo). Locally, the CLI keeps reading portfolio.json as before.
+    inline_json = os.getenv("PORTFOLIO_JSON")
+    if inline_json:
+        try:
+            return json.loads(inline_json)
+        except Exception:
+            return None
     if not os.path.exists(PORTFOLIO_FILE): return None
     try:
         with open(PORTFOLIO_FILE, "r") as f: return json.load(f)
@@ -136,48 +144,82 @@ def prob_finish_above(spot, strike, iv, days_to_exp):
     T = days_to_exp / 365.0
     d2 = (math.log(spot / strike) - 0.5 * iv * iv * T) / (iv * math.sqrt(T))
     return 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+
+def get_tradier_quote(symbol, headers):
+    res = requests.get(f"{TRADIER_BASE_URL}/markets/quotes",
+                        params={"symbols": symbol}, headers=headers, timeout=10).json()
+    q = (res.get('quotes') or {}).get('quote')
+    if isinstance(q, list):
+        q = q[0] if q else None
+    return q
+
+def get_tradier_chain(symbol, expiration, headers):
+    res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
+                        params={"symbol": symbol, "expiration": expiration},
+                        headers=headers, timeout=10).json()
+    options = (res.get('options') or {}).get('option', [])
+    if isinstance(options, dict):
+        options = [options]
+    return options
+
 def track_live_portfolio():
     portfolio = load_portfolio()
     if not portfolio: return f"\n[!] Configuration file '{PORTFOLIO_FILE}' not found or is empty."
+    token = os.getenv("TRADIER_API_KEY")
+    if not token: return "\n[!] TRADIER_API_KEY not set -- can't pull live prices."
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     report = "\n" + "═"*60 + "\n          LIVE OPTIONS PORTFOLIO RISK TRACKER\n" + "═"*60 + "\n"
     if portfolio.get("butterfly_spreads"):
         report += "─── ACTIVE BUTTERFLY SPREADS ───\n"
         for bfly in portfolio["butterfly_spreads"]:
             try:
                 tk = bfly["ticker"]
-                stock = yf.Ticker(tk)
-                spot = stock.history(period="1d")['Close'].iloc[-1]
-                chain = stock.option_chain(bfly["expiration"]).calls
-                low_rows = chain[chain['strike'] == bfly['long_low_strike']].to_dict('records')
-                mid_rows = chain[chain['strike'] == bfly['short_mid_strike']].to_dict('records')
-                high_rows = chain[chain['strike'] == bfly['long_high_strike']].to_dict('records')
-                if not (low_rows and mid_rows and high_rows): continue
-                p_low = (low_rows[0]['bid'] + low_rows[0]['ask']) / 2
-                p_mid = (mid_rows[0]['bid'] + mid_rows[0]['ask']) / 2
-                p_high = (high_rows[0]['bid'] + high_rows[0]['ask']) / 2
+                quote = get_tradier_quote(tk, headers)
+                if not quote:
+                    report += f" [!] {tk}: no quote returned\n\n"
+                    continue
+                spot = quote.get('last') or 0
+                calls = [o for o in get_tradier_chain(tk, bfly["expiration"], headers) if o.get('option_type') == 'call']
+                low_rows = [o for o in calls if o.get('strike') == bfly['long_low_strike']]
+                mid_rows = [o for o in calls if o.get('strike') == bfly['short_mid_strike']]
+                high_rows = [o for o in calls if o.get('strike') == bfly['long_high_strike']]
+                if not (low_rows and mid_rows and high_rows):
+                    report += f" [!] {tk}: couldn't find one or more strikes in the {bfly['expiration']} chain\n\n"
+                    continue
+                p_low = ((low_rows[0].get('bid') or 0) + (low_rows[0].get('ask') or 0)) / 2
+                p_mid = ((mid_rows[0].get('bid') or 0) + (mid_rows[0].get('ask') or 0)) / 2
+                p_high = ((high_rows[0].get('bid') or 0) + (high_rows[0].get('ask') or 0)) / 2
                 current_value = p_low + p_high - (2 * p_mid)
                 pnl = (current_value - bfly["entry_debit"]) * 100 * bfly["contracts"]
                 dist_from_pin = abs(spot - bfly["short_mid_strike"])
                 report += f" [{tk.upper()}] Spot: ${spot:.2f} | Exp: {bfly['expiration']}\n   * Net Premium: Entry: ${bfly['entry_debit']:.2f} | Current Mid: ${current_value:.2f}\n   * Position PnL: ${pnl:+.2f} | Distance to Pin: ${dist_from_pin:.2f}\n\n"
-            except: continue
+            except Exception as e:
+                report += f" [!] {bfly.get('ticker', '?')}: {e}\n\n"
     if portfolio.get("bullish_debit_spreads"):
         report += "─── ACTIVE BULLISH DEBIT SPREADS ───\n"
         for spread in portfolio["bullish_debit_spreads"]:
             try:
                 tk = spread["ticker"]
-                stock = yf.Ticker(tk)
-                spot = stock.history(period="1d")['Close'].iloc[-1]
-                chain = stock.option_chain(spread["expiration"]).calls
-                long_rows = chain[chain['strike'] == spread['long_strike']].to_dict('records')
-                short_rows = chain[chain['strike'] == spread['short_strike']].to_dict('records')
-                if not (long_rows and short_rows): continue
-                p_long = (long_rows[0]['bid'] + long_rows[0]['ask']) / 2
-                p_short = (short_rows[0]['bid'] + short_rows[0]['ask']) / 2
+                quote = get_tradier_quote(tk, headers)
+                if not quote:
+                    report += f" [!] {tk}: no quote returned\n\n"
+                    continue
+                spot = quote.get('last') or 0
+                calls = [o for o in get_tradier_chain(tk, spread["expiration"], headers) if o.get('option_type') == 'call']
+                long_rows = [o for o in calls if o.get('strike') == spread['long_strike']]
+                short_rows = [o for o in calls if o.get('strike') == spread['short_strike']]
+                if not (long_rows and short_rows):
+                    report += f" [!] {tk}: couldn't find one or more strikes in the {spread['expiration']} chain\n\n"
+                    continue
+                p_long = ((long_rows[0].get('bid') or 0) + (long_rows[0].get('ask') or 0)) / 2
+                p_short = ((short_rows[0].get('bid') or 0) + (short_rows[0].get('ask') or 0)) / 2
                 current_value = p_long - p_short
                 pnl = (current_value - spread["entry_debit"]) * 100 * spread["contracts"]
                 report += f" [{tk.upper()}] Spot: ${spot:.2f} | Exp: {spread['expiration']}\n   * Structure: +${spread['long_strike']}C / -${spread['short_strike']}C\n   * Net Premium: Entry: ${spread['entry_debit']:.2f} | Current Mid: ${current_value:.2f}\n   * Position PnL: ${pnl:+.2f}\n\n"
-            except: continue
+            except Exception as e:
+                report += f" [!] {spread.get('ticker', '?')}: {e}\n\n"
     return report
+
 def scan_single_ticker(ticker):
     """Pulls option chains via Tradier."""
     setups = []
@@ -311,14 +353,14 @@ def format_setup_list(setups, header):
         section += f"{i}. [{setup['ticker'].upper()}] (Ratio: {setup['score']:.1f}:1, Est. EV: ${setup['ev']:+.2f})\n   {setup['desc']}\n\n"
     return section
 
-def run_bulk_screener():
+def run_bulk_screener(progress=print):
     all_setups = []
-    print(f" [*] Universe: {len(UNIVERSE)} candidate tickers. Checking liquidity (price/volume)...")
-    liquid_tickers = filter_liquid_universe(UNIVERSE)
-    print(f" [*] {len(liquid_tickers)} tickers passed the liquidity filter (avg volume >= {MIN_AVG_VOLUME:,}, price >= ${MIN_PRICE:.0f}).")
+    progress(f" [*] Universe: {len(UNIVERSE)} candidate tickers. Checking liquidity (price/volume)...")
+    liquid_tickers = filter_liquid_universe(UNIVERSE, progress=progress)
+    progress(f" [*] {len(liquid_tickers)} tickers passed the liquidity filter (avg volume >= {MIN_AVG_VOLUME:,}, price >= ${MIN_PRICE:.0f}).")
     if not liquid_tickers:
         return "No tickers passed the liquidity filter -- check your Tradier connection or thresholds."
-    print(f" [*] Scanning {len(liquid_tickers)} liquid tickers for options setups via parallel multithreading pools...")
+    progress(f" [*] Scanning {len(liquid_tickers)} liquid tickers for options setups via parallel multithreading pools...")
     with ThreadPoolExecutor(max_workers=15) as executor:
         results = executor.map(scan_single_ticker, liquid_tickers)
     for res_list in results:

@@ -248,6 +248,136 @@ def track_live_portfolio():
             except Exception as e:
                 report += f" [!] {spread.get('ticker', '?')}: {e}\n\n"
     return report
+
+def get_portfolio_status():
+    """Structured version of the portfolio data (same Tradier calls as track_live_portfolio,
+    kept separate so that function stays untouched and proven-working). Returns a list of
+    position dicts, each either containing full computed stats or an 'error' key."""
+    portfolio = load_portfolio()
+    if not portfolio:
+        return {"error": f"Configuration file '{PORTFOLIO_FILE}' not found or is empty."}
+    token = os.getenv("TRADIER_API_KEY")
+    if not token:
+        return {"error": "TRADIER_API_KEY not set -- can't pull live prices."}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    positions = []
+
+    for bfly in portfolio.get("butterfly_spreads", []):
+        tk = bfly.get("ticker", "?")
+        try:
+            quote = get_tradier_quote(tk, headers)
+            if not quote:
+                positions.append({"ticker": tk, "type": "Butterfly Pin", "error": "no quote returned"})
+                continue
+            spot = quote.get('last') or 0
+            calls = [o for o in get_tradier_chain(tk, bfly["expiration"], headers) if o.get('option_type') == 'call']
+            low_rows = [o for o in calls if o.get('strike') == bfly['long_low_strike']]
+            mid_rows = [o for o in calls if o.get('strike') == bfly['short_mid_strike']]
+            high_rows = [o for o in calls if o.get('strike') == bfly['long_high_strike']]
+            if not (low_rows and mid_rows and high_rows):
+                positions.append({"ticker": tk, "type": "Butterfly Pin", "error": f"couldn't find one or more strikes in the {bfly['expiration']} chain"})
+                continue
+            p_low = ((low_rows[0].get('bid') or 0) + (low_rows[0].get('ask') or 0)) / 2
+            p_mid = ((mid_rows[0].get('bid') or 0) + (mid_rows[0].get('ask') or 0)) / 2
+            p_high = ((high_rows[0].get('bid') or 0) + (high_rows[0].get('ask') or 0)) / 2
+            current_value = p_low + p_high - (2 * p_mid)
+            pnl = (current_value - bfly["entry_debit"]) * 100 * bfly["contracts"]
+            dist_from_pin = abs(spot - bfly["short_mid_strike"])
+            days_to_exp = (datetime.strptime(bfly["expiration"], "%Y-%m-%d") - datetime.now()).days
+            wing_width = bfly["short_mid_strike"] - bfly["long_low_strike"]
+            max_profit_per_share = wing_width - bfly["entry_debit"]
+            max_profit_total = max_profit_per_share * 100 * bfly["contracts"]
+            profit_captured_pct = (pnl / max_profit_total * 100) if max_profit_total > 0 else None
+            positions.append({
+                "ticker": tk, "type": "Butterfly Pin", "spot": spot, "expiration": bfly["expiration"],
+                "days_to_exp": days_to_exp, "entry_debit": bfly["entry_debit"], "current_value": current_value,
+                "pnl": pnl, "contracts": bfly["contracts"], "dist_from_pin": dist_from_pin,
+                "pin_strike": bfly["short_mid_strike"], "wing_width": wing_width,
+                "max_profit_total": max_profit_total, "profit_captured_pct": profit_captured_pct,
+            })
+        except Exception as e:
+            positions.append({"ticker": tk, "type": "Butterfly Pin", "error": str(e)})
+
+    for spread in portfolio.get("bullish_debit_spreads", []):
+        tk = spread.get("ticker", "?")
+        try:
+            quote = get_tradier_quote(tk, headers)
+            if not quote:
+                positions.append({"ticker": tk, "type": "Debit Vertical", "error": "no quote returned"})
+                continue
+            spot = quote.get('last') or 0
+            calls = [o for o in get_tradier_chain(tk, spread["expiration"], headers) if o.get('option_type') == 'call']
+            long_rows = [o for o in calls if o.get('strike') == spread['long_strike']]
+            short_rows = [o for o in calls if o.get('strike') == spread['short_strike']]
+            if not (long_rows and short_rows):
+                positions.append({"ticker": tk, "type": "Debit Vertical", "error": f"couldn't find one or more strikes in the {spread['expiration']} chain"})
+                continue
+            p_long = ((long_rows[0].get('bid') or 0) + (long_rows[0].get('ask') or 0)) / 2
+            p_short = ((short_rows[0].get('bid') or 0) + (short_rows[0].get('ask') or 0)) / 2
+            current_value = p_long - p_short
+            pnl = (current_value - spread["entry_debit"]) * 100 * spread["contracts"]
+            days_to_exp = (datetime.strptime(spread["expiration"], "%Y-%m-%d") - datetime.now()).days
+            breakeven = spread["long_strike"] + spread["entry_debit"]
+            max_value = spread["short_strike"] - spread["long_strike"]
+            max_profit_per_share = max_value - spread["entry_debit"]
+            max_profit_total = max_profit_per_share * 100 * spread["contracts"]
+            profit_captured_pct = (pnl / max_profit_total * 100) if max_profit_total > 0 else None
+            positions.append({
+                "ticker": tk, "type": "Debit Vertical", "spot": spot, "expiration": spread["expiration"],
+                "days_to_exp": days_to_exp, "entry_debit": spread["entry_debit"], "current_value": current_value,
+                "pnl": pnl, "contracts": spread["contracts"], "breakeven": breakeven,
+                "long_strike": spread["long_strike"], "short_strike": spread["short_strike"],
+                "max_profit_total": max_profit_total, "profit_captured_pct": profit_captured_pct,
+            })
+        except Exception as e:
+            positions.append({"ticker": tk, "type": "Debit Vertical", "error": str(e)})
+
+    return {"positions": positions}
+
+def generate_narrative(pos):
+    """Plain-language summary of a single position: where it stands, what's driving P/L,
+    and general rule-of-thumb context (not personalized advice) on what many options
+    traders watch for. Informational only -- not a recommendation to act."""
+    if pos.get("error"):
+        return f"Couldn't pull live data for {pos['ticker']}: {pos['error']}"
+
+    lines = []
+    days = pos["days_to_exp"]
+    pnl = pos["pnl"]
+    pct = pos.get("profit_captured_pct")
+
+    if days < 0:
+        lines.append(f"Expired {abs(days)} day(s) ago ({pos['expiration']}) -- this position should already be closed or settled.")
+    else:
+        lines.append(f"{days} day(s) to expiration ({pos['expiration']}).")
+
+    if pos["type"] == "Butterfly Pin":
+        dist = pos["dist_from_pin"]
+        pin = pos["pin_strike"]
+        wing = pos["wing_width"]
+        lines.append(f"Stock is ${dist:.2f} away from the ${pin:.0f} pin target.")
+        if dist <= wing * 0.3:
+            lines.append("Price is sitting close to the pin -- this is the sweet spot for a butterfly, worth checking daily as expiration nears.")
+        elif dist >= wing * 0.8:
+            lines.append("Price has drifted well outside the profit zone -- the original pin thesis looks unlikely to play out unless it reverses.")
+    else:  # Debit Vertical
+        breakeven = pos["breakeven"]
+        short_strike = pos["short_strike"]
+        lines.append(f"Breakeven is ${breakeven:.2f}; short strike (max profit point) is ${short_strike:.2f}.")
+        if pos["spot"] >= short_strike:
+            lines.append("Stock is already at or above the short strike -- this spread is at or near max profit.")
+        elif pos["spot"] < breakeven:
+            lines.append("Stock is still below breakeven -- needs to move up for this to be profitable by expiration.")
+
+    if pnl > 0 and pct is not None:
+        lines.append(f"Currently up ${pnl:+.2f}, roughly {pct:.0f}% of max theoretical profit captured.")
+        if pct >= 50:
+            lines.append("Many options traders take profits in the 50-75% range on debit spreads rather than holding for full max, since time decay cuts both ways as expiration nears.")
+    elif pnl < 0:
+        lines.append(f"Currently down ${pnl:+.2f}. Worth revisiting whether the original thesis for this trade still holds given the time remaining.")
+
+    return " ".join(lines)
+
 def scan_single_ticker(ticker):
     """Pulls option chains via Tradier."""
     setups = []

@@ -293,6 +293,7 @@ def get_portfolio_status():
                 "days_to_exp": days_to_exp, "entry_debit": bfly["entry_debit"], "current_value": current_value,
                 "pnl": pnl, "contracts": bfly["contracts"], "dist_from_pin": dist_from_pin,
                 "pin_strike": bfly["short_mid_strike"], "wing_width": wing_width,
+                "low_strike": bfly["long_low_strike"], "high_strike": bfly["long_high_strike"],
                 "max_profit_total": max_profit_total, "profit_captured_pct": profit_captured_pct,
             })
         except Exception as e:
@@ -376,9 +377,7 @@ def generate_narrative(pos):
     elif pnl < 0:
         lines.append(f"Currently down ${pnl:+.2f}. Worth revisiting whether the original thesis for this trade still holds given the time remaining.")
 
-    # Escape $ so Streamlit's markdown renderer doesn't interpret pairs of dollar signs
-    # as LaTeX math delimiters (which was swallowing some of the currency amounts).
-    return " ".join(lines).replace("$", "\\$")
+    return " ".join(lines)
 
 def scan_single_ticker(ticker):
     """Pulls option chains via Tradier."""

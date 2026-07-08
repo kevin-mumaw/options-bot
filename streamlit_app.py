@@ -62,6 +62,19 @@ with tab_portfolio:
                     if pos.get("error"):
                         st.warning(pos["error"])
                         continue
+
+                    if pos["type"] == "Butterfly Pin":
+                        structure = f"{pos['low_strike']:.0f} / {pos['pin_strike']:.0f} / {pos['high_strike']:.0f} C"
+                    else:
+                        structure = f"BUY {pos['long_strike']:.0f}C / SELL {pos['short_strike']:.0f}C"
+                    total_paid = pos['entry_debit'] * 100 * pos['contracts']
+                    purchase_info = (
+                        f"Strikes: {structure}  |  Exp: {pos['expiration']}  |  "
+                        f"Contracts: {pos['contracts']}  |  "
+                        f"Paid: ${pos['entry_debit']:.2f}/share (${total_paid:.2f} total)"
+                    ).replace("$", "\\$")
+                    st.caption(purchase_info)
+
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Spot", f"${pos['spot']:.2f}")
                     col2.metric("P/L", f"${pos['pnl']:+.2f}")

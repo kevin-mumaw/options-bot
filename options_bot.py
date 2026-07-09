@@ -6,6 +6,8 @@ import os
 import math
 import time
 import csv
+import base64
+import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -84,6 +86,73 @@ def log_setups_to_csv(setups, log_file=BACKTEST_LOG_FILE):
                 writer.writerow(row)
     except Exception as e:
         print(f" [!] Couldn't write to {log_file}: {e}")
+
+
+def log_setups_to_github(setups, repo, token, branch="main", path=BACKTEST_LOG_FILE):
+    """Appends setups directly to backtest_log.csv in the GitHub repo via the Contents API.
+    Used when running somewhere with no persistent local disk (Streamlit Cloud), so
+    mobile-triggered screener runs still end up in the same history as desktop runs
+    instead of vanishing on the next redeploy."""
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    run_date = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        res = requests.get(api_url, headers=headers, params={"ref": branch}, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            sha = data["sha"]
+            existing_content = base64.b64decode(data["content"]).decode("utf-8")
+        elif res.status_code == 404:
+            sha = None
+            existing_content = ",".join(BACKTEST_LOG_COLUMNS) + "\n"
+        else:
+            print(f" [!] GitHub fetch failed ({res.status_code}): {res.text[:200]}")
+            return
+    except Exception as e:
+        print(f" [!] GitHub fetch error: {e}")
+        return
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=BACKTEST_LOG_COLUMNS)
+    for s in setups:
+        row = {col: s.get(col, "") for col in BACKTEST_LOG_COLUMNS}
+        row["run_date"] = run_date
+        row["graded"] = "no"
+        writer.writerow(row)
+
+    updated_content = existing_content
+    if not updated_content.endswith("\n"):
+        updated_content += "\n"
+    updated_content += buf.getvalue()
+
+    commit_payload = {
+        "message": f"Log {len(setups)} candidate setups from mobile screener run ({run_date})",
+        "content": base64.b64encode(updated_content.encode("utf-8")).decode("utf-8"),
+        "branch": branch,
+    }
+    if sha:
+        commit_payload["sha"] = sha
+
+    try:
+        put_res = requests.put(api_url, headers=headers, json=commit_payload, timeout=15)
+        if put_res.status_code not in (200, 201):
+            print(f" [!] GitHub commit failed ({put_res.status_code}): {put_res.text[:200]}")
+    except Exception as e:
+        print(f" [!] GitHub commit error: {e}")
+
+
+def log_setups(setups):
+    """Logs candidate setups to the backtest history -- straight to GitHub if a
+    GITHUB_TOKEN/GITHUB_REPO secret is present (Streamlit Cloud, no persistent local
+    disk), otherwise to the local CSV file (desktop CLI)."""
+    github_token = os.getenv("GITHUB_TOKEN")
+    github_repo = os.getenv("GITHUB_REPO")
+    if github_token and github_repo:
+        branch = os.getenv("GITHUB_BRANCH", "main")
+        log_setups_to_github(setups, github_repo, github_token, branch=branch)
+    else:
+        log_setups_to_csv(setups)
 
 
 def filter_liquid_universe(tickers, progress=print):
@@ -532,8 +601,8 @@ def run_bulk_screener(progress=print):
         if res_list: all_setups.extend(res_list)
 
     if all_setups:
-        log_setups_to_csv(all_setups)
-        progress(f" [*] Logged {len(all_setups)} candidate setups to {BACKTEST_LOG_FILE} for future grading.")
+        log_setups(all_setups)
+        progress(f" [*] Logged {len(all_setups)} candidate setups for future grading.")
 
     verticals = [s for s in all_setups if s['type'] == 'Debit Vertical' and s['ev'] > 0]
     butterflies = [s for s in all_setups if s['type'] == 'Butterfly Pin' and s['ev'] > 0]

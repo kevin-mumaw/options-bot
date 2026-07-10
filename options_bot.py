@@ -61,7 +61,7 @@ MIN_PRICE = 10.0             # skip penny-priced noise
 
 BACKTEST_LOG_FILE = "backtest_log.csv"
 BACKTEST_LOG_COLUMNS = [
-    "run_date", "ticker", "type", "option_type", "direction", "expiration", "spot_at_scan",
+    "run_date", "ticker", "type", "option_type", "direction", "expiration", "near_expiration", "spot_at_scan",
     "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
     "strike", "call_strike", "put_strike",
     "net_cost", "max_profit", "prob_profit", "ev",
@@ -221,6 +221,31 @@ def get_macro_expiration(expirations):
             return date_str
     return candidates[0][0]  # no monthly in range, fall back to first available
 
+def get_near_term_expiration(expirations, back_date_str):
+    """Picks a near-term expiration (15-35 days out) for the short leg of a calendar
+    spread -- distinct from and earlier than the macro (back-month) expiration. Returns
+    None if nothing suitable exists, since a calendar spread needs two genuinely
+    different dates to make sense."""
+    current_date = datetime.now()
+    min_date = current_date + timedelta(days=15)
+    max_date = current_date + timedelta(days=35)
+    try:
+        back_date = datetime.strptime(back_date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+    candidates = []
+    for date_str in expirations:
+        try:
+            exp_date = datetime.strptime(date_str, "%Y-%m-%d")
+            if min_date <= exp_date <= max_date and exp_date < back_date:
+                candidates.append((date_str, exp_date))
+        except:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1])
+    return candidates[0][0]  # earliest suitable near-term date
+
 def filter_contract_liquidity(df):
     if df.empty: return df
     if 'openInterest' in df.columns:
@@ -244,6 +269,32 @@ def prob_finish_above(spot, strike, iv, days_to_exp):
     T = days_to_exp / 365.0
     d2 = (math.log(spot / strike) - 0.5 * iv * iv * T) / (iv * math.sqrt(T))
     return 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+
+def bs_call_price(spot, strike, iv, days_to_exp):
+    """Black-Scholes theoretical price of a call option (r=0, no dividends -- same
+    simplifications used throughout this tool). Needed for calendar spreads: unlike
+    every other strategy here, a calendar's value at the point that matters (the
+    near-month expiration) depends on re-pricing the still-alive far-month option, not
+    just looking up the stock's terminal price."""
+    if spot <= 0 or strike <= 0 or iv <= 0 or days_to_exp <= 0:
+        return max(0.0, spot - strike)  # degenerates to intrinsic value at/after expiration
+    T = days_to_exp / 365.0
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * math.sqrt(T))
+    d2 = d1 - iv * math.sqrt(T)
+    Nd1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    Nd2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+    return spot * Nd1 - strike * Nd2
+
+def bs_put_price(spot, strike, iv, days_to_exp):
+    """Black-Scholes theoretical price of a put option (r=0, no dividends)."""
+    if spot <= 0 or strike <= 0 or iv <= 0 or days_to_exp <= 0:
+        return max(0.0, strike - spot)
+    T = days_to_exp / 365.0
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * T) / (iv * math.sqrt(T))
+    d2 = d1 - iv * math.sqrt(T)
+    Nd1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    Nd2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+    return strike * (1 - Nd2) - spot * (1 - Nd1)
 
 def expected_move(spot, iv, days_to_exp):
     """Standard 1-standard-deviation expected price move by expiration, from IV. Used as
@@ -762,6 +813,68 @@ def scan_single_ticker(ticker):
                             "net_cost": net_cost, "max_profit": max_bfly_profit,
                             "desc": f"[NEUTRAL] Pin Target ${mid_leg['strike']} (${low_leg['strike']}/{mid_leg['strike']}/{high_leg['strike']}) (Cost: ${net_cost:.2f} | Max Gain: ${max_bfly_profit:.2f}) | Exp: {target_date} | Est. Prob. in Profit Zone: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                         })
+
+            # Calendar spread candidate: only when the near-term option is pricing in
+            # meaningfully MORE volatility than the far-term one (term structure
+            # inversion) -- classic setup around an upcoming near-term catalyst. Added
+            # alongside butterflies, not instead of them; the EV ranking decides which
+            # surfaces higher.
+            near_date = get_near_term_expiration(expirations, target_date)
+            if near_date and not atm_calls.empty:
+                try:
+                    near_chain_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
+                                                   params={"symbol": ticker, "expiration": near_date, "greeks": "true"},
+                                                   headers=headers, timeout=10).json()
+                    near_options = (near_chain_res.get('options') or {}).get('option', [])
+                    if isinstance(near_options, dict): near_options = [near_options]
+                    near_calls_list = []
+                    for opt in near_options:
+                        if opt.get('option_type') != 'call': continue
+                        g = opt.get('greeks') or {}
+                        near_calls_list.append({
+                            'strike': opt.get('strike'), 'bid': opt.get('bid') or 0, 'ask': opt.get('ask') or 0,
+                            'openInterest': opt.get('open_interest') or 0,
+                            'impliedVolatility': g.get('mid_iv') or g.get('smv_vol') or 0.35
+                        })
+                    near_calls = filter_contract_liquidity(pd.DataFrame(near_calls_list))
+                    if not near_calls.empty:
+                        near_atm = near_calls[(near_calls['strike'] >= spot * 0.90) & (near_calls['strike'] <= spot * 1.10)]
+                        back_atm_iv = atm_calls['impliedVolatility'].mean()
+                        near_atm_iv = near_atm['impliedVolatility'].mean() if not near_atm.empty else 0
+                        if near_atm_iv > 0 and back_atm_iv > 0 and (near_atm_iv / back_atm_iv) >= 1.15:
+                            common = sorted(set(atm_calls['strike']) & set(near_atm['strike']))
+                            if common:
+                                cal_strike = min(common, key=lambda k: abs(k - spot))
+                                back_leg = atm_calls[atm_calls['strike'] == cal_strike].iloc[0].to_dict()
+                                near_leg = near_atm[near_atm['strike'] == cal_strike].iloc[0].to_dict()
+                                net_cost = back_leg['ask'] - near_leg['bid']
+                                near_days = (datetime.strptime(near_date, "%Y-%m-%d") - datetime.now()).days
+                                remaining_days = days_to_exp - near_days
+                                if 0.15 < net_cost <= 4.00 and remaining_days > 0:
+                                    # ROUGH estimate only -- assumes the stock stays exactly
+                                    # at today's spot AND back-month IV is unchanged by the
+                                    # time the near leg expires. Real calendar spreads often
+                                    # profit mainly from an IV CRUSH after a catalyst passes,
+                                    # which this does not model at all. Treat this as a
+                                    # coarse ranking signal, not a price target.
+                                    assumed_back_value = bs_call_price(spot, cal_strike, back_leg['impliedVolatility'], remaining_days)
+                                    near_intrinsic_at_exp = max(0.0, spot - cal_strike)
+                                    assumed_value_at_near_exp = assumed_back_value - near_intrinsic_at_exp
+                                    assumed_profit = assumed_value_at_near_exp - net_cost
+                                    near_em = expected_move(spot, near_leg['impliedVolatility'], near_days)
+                                    prob_profit = prob_finish_above(spot, cal_strike - near_em, near_leg['impliedVolatility'], near_days) - prob_finish_above(spot, cal_strike + near_em, near_leg['impliedVolatility'], near_days)
+                                    prob_profit = max(0.0, min(1.0, prob_profit))
+                                    if assumed_profit >= (net_cost * 1.0):  # lower bar than other strategies -- this estimate is coarser
+                                        ev = prob_profit * assumed_profit - (1 - prob_profit) * net_cost
+                                        setups.append({
+                                            "ticker": ticker, "type": "Calendar Spread", "option_type": "call", "direction": "neutral",
+                                            "score": assumed_profit / net_cost if net_cost > 0 else 0, "prob_profit": prob_profit, "ev": ev,
+                                            "expiration": target_date, "near_expiration": near_date, "spot_at_scan": spot, "strike": cal_strike,
+                                            "net_cost": net_cost, "max_profit": assumed_profit,
+                                            "desc": f"[NEUTRAL/TERM STRUCTURE] SELL ${cal_strike} C {near_date} / BUY ${cal_strike} C {target_date} (Cost: ${net_cost:.2f} | Est. Value @ near exp (flat stock, unchanged IV): ${assumed_value_at_near_exp:.2f}) | Est. Prob. Stock Stays Near Strike: {prob_profit*100:.0f}% | EV: ${ev:+.2f} -- ROUGH ESTIMATE, cannot be backtested with free data"
+                                        })
+                except Exception:
+                    pass  # calendar candidate is a bonus signal -- don't let it break the rest of the scan
     except Exception as e:
         print(f" [!] {ticker}: {e}")
     return setups
@@ -810,6 +923,7 @@ def run_bulk_screener(progress=print):
     strangles = [s for s in all_setups if s['type'] == 'Long Strangle' and s['ev'] > 0]
     long_calls = [s for s in all_setups if s['type'] == 'Long Call' and s['ev'] > 0]
     long_puts = [s for s in all_setups if s['type'] == 'Long Put' and s['ev'] > 0]
+    calendars = [s for s in all_setups if s['type'] == 'Calendar Spread' and s['ev'] > 0]
 
     top_verticals = sorted(dedupe_best_per_ticker(verticals), key=lambda x: x['ev'], reverse=True)[:3]
     top_butterflies = sorted(dedupe_best_per_ticker(butterflies), key=lambda x: x['ev'], reverse=True)[:3]
@@ -817,8 +931,9 @@ def run_bulk_screener(progress=print):
     top_strangles = sorted(dedupe_best_per_ticker(strangles), key=lambda x: x['ev'], reverse=True)[:3]
     top_long_calls = sorted(dedupe_best_per_ticker(long_calls), key=lambda x: x['ev'], reverse=True)[:3]
     top_long_puts = sorted(dedupe_best_per_ticker(long_puts), key=lambda x: x['ev'], reverse=True)[:3]
+    top_calendars = sorted(dedupe_best_per_ticker(calendars), key=lambda x: x['ev'], reverse=True)[:3]
 
-    if not any([top_verticals, top_butterflies, top_straddles, top_strangles, top_long_calls, top_long_puts]):
+    if not any([top_verticals, top_butterflies, top_straddles, top_strangles, top_long_calls, top_long_puts, top_calendars]):
         return "No positive-expected-value setups identified across the universe today. That's a legitimate result, not an error -- it means nothing in today's liquid universe cleared the bar once probability of profit is factored in."
 
     summary = format_setup_list(top_verticals, "=== TOP DEBIT VERTICALS (1 per ticker, positive EV only) ===")
@@ -839,6 +954,9 @@ def run_bulk_screener(progress=print):
     summary += format_setup_list(top_long_puts, "=== TOP LONG PUTS (1 per ticker, positive EV only) ===")
     if not top_long_puts:
         summary += "=== TOP LONG PUTS ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_calendars, "=== TOP CALENDAR SPREADS (1 per ticker, positive EV only -- UNGRADABLE ESTIMATE, see USER_GUIDE.md) ===")
+    if not top_calendars:
+        summary += "=== TOP CALENDAR SPREADS ===\nNone found with positive estimated EV today.\n\n"
     return summary
 
 if __name__ == "__main__":

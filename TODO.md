@@ -44,13 +44,20 @@ rushing architecture changes late in a long session.
         it: when the premium you'd sell to build a spread is cheap, the discount isn't
         worth giving up uncapped upside for. No new backtest schema needed -- reused
         the `strike`/`option_type`/`direction` columns already added for straddles.
-  - [ ] Calendar spreads -- when they make sense (expecting low near-term movement,
-        benefiting from time decay differences between expirations). This is the last
-        planned strategy type for this phase.
-  - [ ] Streamlit app: Screener tab now has SIX possible section types (verticals,
-        butterflies, straddles, strangles, long calls, long puts). The tagged text
-        format still works but is getting long -- consider whether the mobile view
-        needs a more compact/collapsible layout once calendars are added too.
+  - [x] Calendar spreads -- implemented and tested, but with an important honest
+        caveat: this is the ONE strategy that can't be backtested with free data (its
+        payoff depends on a historical option price at an interim date, not just the
+        stock's price at expiration -- same paid-data wall as the original Polygon
+        problem, just resurfacing here). `grade_backtest.py` marks these `not_gradable`
+        rather than pretending to check them against reality. Uses Black-Scholes
+        option pricing for the first time in this tool (previously only used for
+        probability, never for pricing) -- verified against put-call parity and the
+        standard textbook ATM approximation before shipping.
+  - [x] Streamlit app: text-tag approach (`[BULLISH]` etc.) held up fine through all
+        six strategy types -- no dedicated-sections rework needed after all.
+
+**Phase 1 of strategy selection is essentially complete**: 6 strategy types, all
+regime-aware, 5 of 6 fully backtestable. Remaining polish items live in Backlog below.
 
 ## Completed
 

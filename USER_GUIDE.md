@@ -264,6 +264,48 @@ on how far you actually expect the stock to move, which is exactly what the chea
 signal is trying to flag: recent real movement has been bigger than what the option
 market is currently charging for.
 
+## 12. Calendar spreads -- the one strategy this tool can't backtest
+
+**Read this before trading anything tagged `[NEUTRAL/TERM STRUCTURE]`.**
+
+A calendar spread means selling a near-term option and buying a farther-dated option at
+the *same strike*. Unlike every other strategy in this tool, its profit isn't just
+"where did the stock close at expiration" -- it's realized at the **near-term**
+expiration, based on what the still-alive far-dated option is worth *at that moment*,
+which depends on implied volatility at that future date, not just the stock's price.
+
+**Why the screener uses it**: when the near-term option is pricing in meaningfully more
+volatility than the far-dated one (a "term structure inversion," often around an
+upcoming earnings date or other near-term catalyst), that's the classic calendar
+spread setup -- sell the richly-priced near-term premium, buy the relatively cheaper
+far-dated premium.
+
+**What the estimate actually assumes (read this part carefully)**:
+- The stock stays exactly at today's price until the near-term expiration (a "flat
+  stock" assumption)
+- The far-month option's implied volatility doesn't change between now and then (an
+  "unchanged IV" assumption)
+
+Both of these are real simplifications, and the second one in particular is often
+**wrong in exactly the situation that makes calendars attractive in the first place**:
+real calendar spreads frequently profit from an IV *crush* right after the catalyst
+that caused the term structure inversion (e.g., IV collapsing right after an earnings
+report), which this estimate does not model at all.
+
+**Why it can't be backtested like everything else**: grading requires knowing what the
+far-month option's *actual market price* was on the near-month expiration date -- a
+real historical option price, not just the stock's closing price. That's exactly the
+kind of historical options data this tool doesn't have free access to (the same wall
+we hit early on with Polygon). `grade_backtest.py` marks these rows `not_gradable`
+once their near leg expires, rather than pretending to check them against a formula
+that would just be re-confirming its own scan-time assumptions instead of reality.
+
+**Bottom line**: treat calendar spreads as a much rougher, more speculative signal than
+everything else this tool produces. The `[TERM STRUCTURE]` tag and the "ROUGH ESTIMATE,
+cannot be backtested" note in the description are there on purpose -- this is the one
+strategy where you're relying more on the tool's reasoning than on anything it's
+actually verified against real outcomes.
+
 ---
 
 *This guide will grow over time as new concepts come up -- treat it as a living

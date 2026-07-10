@@ -26,7 +26,7 @@ BACKUP_FILE = "backtest_log_backup.csv"
 
 # Keep this in sync with BACKTEST_LOG_COLUMNS in options_bot.py
 CURRENT_COLUMNS = [
-    "run_date", "ticker", "type", "option_type", "direction", "expiration", "spot_at_scan",
+    "run_date", "ticker", "type", "option_type", "direction", "expiration", "near_expiration", "spot_at_scan",
     "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
     "strike", "call_strike", "put_strike",
     "net_cost", "max_profit", "prob_profit", "ev",

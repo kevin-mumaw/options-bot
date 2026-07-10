@@ -13,9 +13,13 @@ Streamlit Cloud's shared IPs get rate-limited/blocked by Yahoo Finance.
   vs. realized volatility) from free data, and scans the strategy that regime calls
   for: bull call verticals / bear put verticals when IV is normally priced, long
   calls / long puts / straddles / strangles when IV looks cheap relative to how much
-  the stock actually moves, butterflies when neutral with normally-priced IV. Ranks
-  results by an estimated probability-weighted expected value (Black-Scholes based),
-  not just raw payout ratio, and only surfaces genuinely positive-EV setups.
+  the stock actually moves, butterflies when neutral with normally-priced IV, and
+  calendar spreads when a near-term option is pricing in meaningfully more volatility
+  than a farther-dated one. Ranks results by an estimated probability-weighted expected
+  value (Black-Scholes based), not just raw payout ratio, and only surfaces genuinely
+  positive-EV setups. **Calendar spreads are a rougher estimate than everything else
+  and can't be backtested with free data** -- see `USER_GUIDE.md` Section 12 before
+  trading one.
 - **Portfolio tracker**: reports live P/L on open positions using current Tradier quotes
   and option chain prices. The mobile view also shows a plain-language narrative per
   position -- days to expiration, distance from pin/breakeven, % of max profit captured,
@@ -61,6 +65,12 @@ the more setups that accumulate and expire, the more reliable the calibration re
 becomes. Early on, with only a handful of graded setups, don't over-interpret the
 numbers; wait for a meaningful sample size (dozens, ideally hundreds) before trusting
 the calibration gap as a signal to change the model.
+
+**Calendar spreads are excluded from this.** Their outcome depends on a historical
+option price this tool doesn't have free access to, not just the stock's closing
+price. `grade_backtest.py` marks them `not_gradable` once their near leg expires
+instead of grading them with a formula that couldn't check them against anything real.
+See `USER_GUIDE.md` Section 12 for the full explanation.
 
 **Desktop vs. mobile logging**: the desktop CLI writes new setups straight to your local
 `backtest_log.csv` (you `git add`/`commit`/`push` when you want, same as any other file

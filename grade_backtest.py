@@ -46,6 +46,16 @@ def butterfly_payoff(spot_at_exp, low_strike, mid_strike, high_strike):
     return low_value - (2 * mid_value) + high_value
 
 
+def straddle_payoff(spot_at_exp, strike):
+    """Payoff of a long straddle (long call + long put, same strike) at expiration."""
+    return max(0.0, spot_at_exp - strike) + max(0.0, strike - spot_at_exp)
+
+
+def strangle_payoff(spot_at_exp, call_strike, put_strike):
+    """Payoff of a long strangle (long OTM call + long OTM put) at expiration."""
+    return max(0.0, spot_at_exp - call_strike) + max(0.0, put_strike - spot_at_exp)
+
+
 def get_closing_price_near(ticker, date_str):
     """Pulls the stock's closing price on the given date, falling back to the nearest
     prior trading day within a week if the exact date isn't a trading day (holiday, etc)."""
@@ -94,6 +104,10 @@ def grade_log(log_file=LOG_FILE):
                 payoff = call_vertical_payoff(spot_at_exp, float(row["long_strike"]), float(row["short_strike"]))
         elif row["type"] == "Butterfly Pin":
             payoff = butterfly_payoff(spot_at_exp, float(row["low_strike"]), float(row["mid_strike"]), float(row["high_strike"]))
+        elif row["type"] == "Long Straddle":
+            payoff = straddle_payoff(spot_at_exp, float(row["strike"]))
+        elif row["type"] == "Long Strangle":
+            payoff = strangle_payoff(spot_at_exp, float(row["call_strike"]), float(row["put_strike"]))
         else:
             continue
 
@@ -129,6 +143,8 @@ def print_calibration_report(rows):
         ("Bull Call Verticals", lambda r: r["type"] == "Debit Vertical" and (r.get("direction") or "bullish") == "bullish"),
         ("Bear Put Verticals", lambda r: r["type"] == "Debit Vertical" and r.get("direction") == "bearish"),
         ("Butterflies (Neutral)", lambda r: r["type"] == "Butterfly Pin"),
+        ("Long Straddles (Neutral, Cheap IV)", lambda r: r["type"] == "Long Straddle"),
+        ("Long Strangles (Neutral, Cheap IV)", lambda r: r["type"] == "Long Strangle"),
     ]
 
     for label, match_fn in buckets:

@@ -63,6 +63,7 @@ BACKTEST_LOG_FILE = "backtest_log.csv"
 BACKTEST_LOG_COLUMNS = [
     "run_date", "ticker", "type", "option_type", "direction", "expiration", "spot_at_scan",
     "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
+    "strike", "call_strike", "put_strike",
     "net_cost", "max_profit", "prob_profit", "ev",
     "graded", "actual_spot_at_exp", "actual_payoff", "actual_pnl", "win"
 ]
@@ -243,6 +244,24 @@ def prob_finish_above(spot, strike, iv, days_to_exp):
     T = days_to_exp / 365.0
     d2 = (math.log(spot / strike) - 0.5 * iv * iv * T) / (iv * math.sqrt(T))
     return 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+
+def expected_move(spot, iv, days_to_exp):
+    """Standard 1-standard-deviation expected price move by expiration, from IV. Used as
+    a representative 'typical move' size for straddle/strangle payoff estimates, since
+    those structures don't have a natural max-profit cap the way verticals/butterflies do."""
+    if spot <= 0 or iv <= 0 or days_to_exp <= 0:
+        return 0.0
+    return spot * iv * math.sqrt(days_to_exp / 365.0)
+
+def straddle_payoff_at_price(price, strike):
+    """Payoff of a long straddle (long call + long put, same strike) at a given
+    terminal price, before subtracting cost. Equivalent to |price - strike|."""
+    return max(0.0, price - strike) + max(0.0, strike - price)
+
+def strangle_payoff_at_price(price, call_strike, put_strike):
+    """Payoff of a long strangle (long OTM call + long OTM put, different strikes) at a
+    given terminal price, before subtracting cost."""
+    return max(0.0, price - call_strike) + max(0.0, put_strike - price)
 
 def detect_regime(ticker, current_iv, price_history=None):
     """Classifies a ticker's regime using only free data:
@@ -616,6 +635,68 @@ def scan_single_ticker(ticker):
                         "desc": f"[BEARISH] BUY ${long_leg['strike']} P / SELL ${short_leg['strike']} P (Cost: ${net_debit:.2f} | Max Gain: ${max_profit:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                     })
 
+        elif trend == "neutral" and regime["iv_regime"] == "cheap" and not atm_calls.empty and not atm_puts.empty:
+            # IV cheap relative to actual recent movement -- premium looks underpriced for
+            # the moves this stock has actually been making, so buying it (straddle/strangle)
+            # is more attractive here than selling it via a butterfly.
+            # Use REALIZED volatility (not the option's own cheap IV) to estimate the
+            # expected move. The whole thesis here is "IV is underpricing how much this
+            # stock actually moves" -- so the payoff estimate should reflect that real
+            # movement, not the same cheap IV that's mispricing the options in the first
+            # place (which would be circular and understate the opportunity).
+            em = expected_move(spot, regime["realized_vol"], days_to_exp)
+
+            # Long straddle: same strike, nearest to spot, present in both calls and puts
+            common_strikes = sorted(set(atm_calls['strike']) & set(atm_puts['strike']))
+            if common_strikes:
+                straddle_strike = min(common_strikes, key=lambda k: abs(k - spot))
+                call_leg = atm_calls[atm_calls['strike'] == straddle_strike].iloc[0].to_dict()
+                put_leg = atm_puts[atm_puts['strike'] == straddle_strike].iloc[0].to_dict()
+                net_cost = call_leg['ask'] + put_leg['ask']
+                breakeven_up = straddle_strike + net_cost
+                breakeven_down = straddle_strike - net_cost
+                avg_iv = (call_leg['impliedVolatility'] + put_leg['impliedVolatility']) / 2
+                prob_profit = prob_finish_above(spot, breakeven_up, avg_iv, days_to_exp) + (1 - prob_finish_above(spot, breakeven_down, avg_iv, days_to_exp))
+                prob_profit = min(1.0, prob_profit)
+                assumed_payoff = max(0.0,
+                    straddle_payoff_at_price(spot + em, straddle_strike) - net_cost,
+                    straddle_payoff_at_price(spot - em, straddle_strike) - net_cost)
+                if 0.15 < net_cost <= 4.00 and assumed_payoff >= (net_cost * 2.0):
+                    ev = prob_profit * assumed_payoff - (1 - prob_profit) * net_cost
+                    setups.append({
+                        "ticker": ticker, "type": "Long Straddle", "option_type": "both", "direction": "neutral",
+                        "score": assumed_payoff / net_cost, "prob_profit": prob_profit, "ev": ev,
+                        "expiration": target_date, "spot_at_scan": spot, "strike": straddle_strike,
+                        "net_cost": net_cost, "max_profit": assumed_payoff,
+                        "desc": f"[NEUTRAL/CHEAP IV] BUY ${straddle_strike} C + BUY ${straddle_strike} P (Cost: ${net_cost:.2f} | Est. Payoff @ ~1SD move: ${assumed_payoff:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                    })
+
+            # Long strangle: nearest OTM call above spot, nearest OTM put below spot
+            otm_calls = atm_calls[atm_calls['strike'] > spot]
+            otm_puts = atm_puts[atm_puts['strike'] < spot]
+            if not otm_calls.empty and not otm_puts.empty:
+                call_leg = otm_calls.loc[otm_calls['strike'].idxmin()].to_dict()
+                put_leg = otm_puts.loc[otm_puts['strike'].idxmax()].to_dict()
+                net_cost = call_leg['ask'] + put_leg['ask']
+                breakeven_up = call_leg['strike'] + net_cost
+                breakeven_down = put_leg['strike'] - net_cost
+                avg_iv = (call_leg['impliedVolatility'] + put_leg['impliedVolatility']) / 2
+                prob_profit = prob_finish_above(spot, breakeven_up, avg_iv, days_to_exp) + (1 - prob_finish_above(spot, breakeven_down, avg_iv, days_to_exp))
+                prob_profit = min(1.0, prob_profit)
+                assumed_payoff = max(0.0,
+                    strangle_payoff_at_price(spot + em, call_leg['strike'], put_leg['strike']) - net_cost,
+                    strangle_payoff_at_price(spot - em, call_leg['strike'], put_leg['strike']) - net_cost)
+                if 0.15 < net_cost <= 4.00 and assumed_payoff >= (net_cost * 2.0):
+                    ev = prob_profit * assumed_payoff - (1 - prob_profit) * net_cost
+                    setups.append({
+                        "ticker": ticker, "type": "Long Strangle", "option_type": "both", "direction": "neutral",
+                        "score": assumed_payoff / net_cost, "prob_profit": prob_profit, "ev": ev,
+                        "expiration": target_date, "spot_at_scan": spot,
+                        "call_strike": call_leg['strike'], "put_strike": put_leg['strike'],
+                        "net_cost": net_cost, "max_profit": assumed_payoff,
+                        "desc": f"[NEUTRAL/CHEAP IV] BUY ${call_leg['strike']} C + BUY ${put_leg['strike']} P (Cost: ${net_cost:.2f} | Est. Payoff @ ~1SD move: ${assumed_payoff:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                    })
+
         elif trend == "neutral" and len(atm_calls) >= 3:
             for idx in range(len(atm_calls) - 2):
                 low_leg = atm_calls.iloc[idx].to_dict()
@@ -643,6 +724,7 @@ def scan_single_ticker(ticker):
     except Exception as e:
         print(f" [!] {ticker}: {e}")
     return setups
+
 
 
 
@@ -683,11 +765,15 @@ def run_bulk_screener(progress=print):
 
     verticals = [s for s in all_setups if s['type'] == 'Debit Vertical' and s['ev'] > 0]
     butterflies = [s for s in all_setups if s['type'] == 'Butterfly Pin' and s['ev'] > 0]
+    straddles = [s for s in all_setups if s['type'] == 'Long Straddle' and s['ev'] > 0]
+    strangles = [s for s in all_setups if s['type'] == 'Long Strangle' and s['ev'] > 0]
 
     top_verticals = sorted(dedupe_best_per_ticker(verticals), key=lambda x: x['ev'], reverse=True)[:3]
     top_butterflies = sorted(dedupe_best_per_ticker(butterflies), key=lambda x: x['ev'], reverse=True)[:3]
+    top_straddles = sorted(dedupe_best_per_ticker(straddles), key=lambda x: x['ev'], reverse=True)[:3]
+    top_strangles = sorted(dedupe_best_per_ticker(strangles), key=lambda x: x['ev'], reverse=True)[:3]
 
-    if not top_verticals and not top_butterflies:
+    if not any([top_verticals, top_butterflies, top_straddles, top_strangles]):
         return "No positive-expected-value setups identified across the universe today. That's a legitimate result, not an error -- it means nothing in today's liquid universe cleared the bar once probability of profit is factored in."
 
     summary = format_setup_list(top_verticals, "=== TOP DEBIT VERTICALS (1 per ticker, positive EV only) ===")
@@ -696,6 +782,8 @@ def run_bulk_screener(progress=print):
     summary += format_setup_list(top_butterflies, "=== TOP BUTTERFLY PINS (1 per ticker, positive EV only) ===")
     if not top_butterflies:
         summary += "=== TOP BUTTERFLY PINS ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_straddles, "=== TOP LONG STRADDLES (1 per ticker, positive EV only) ===")
+    summary += format_setup_list(top_strangles, "=== TOP LONG STRANGLES (1 per ticker, positive EV only) ===")
     return summary
 
 if __name__ == "__main__":
@@ -718,4 +806,4 @@ if __name__ == "__main__":
     elif choice == "2":
         print(run_bulk_screener())
     else:
-        print("Invalid choice selected.")s
+        print("Invalid choice selected.")

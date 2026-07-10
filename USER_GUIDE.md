@@ -195,6 +195,44 @@ recent realized volatility. This is the foundation for adding straddles/strangle
 later (cheap IV + expecting a big move = attractive to buy premium) -- not wired into
 strategy selection yet, just being calculated and logged for now.
 
+## 10. Straddles and strangles -- when the screener uses them
+
+As of this update, a **neutral-trend** ticker doesn't automatically mean a butterfly.
+The screener also checks whether IV is "cheap" relative to the stock's own recent
+realized volatility (see Section 9's IV-richness signal). If it is, that's a signal the
+options market may be underpricing how much this stock actually moves -- a better
+setup for **buying** premium (straddle/strangle) than **selling** it (butterfly).
+
+| Neutral trend + | Strategy scanned |
+|---|---|
+| IV rich or fair | Butterfly (unchanged -- betting on the stock staying pinned) |
+| IV cheap | Long straddle / long strangle (betting on a real move, direction unknown) |
+
+**Long straddle**: buy a call and a put at the *same* strike (closest to the current
+price). Profits if the stock moves far enough in *either* direction to cover the
+combined cost of both options. Loses the full cost if the stock sits exactly at that
+strike at expiration.
+
+**Long strangle**: buy an out-of-the-money call and an out-of-the-money put at
+*different* strikes, straddling the current price from outside. Cheaper to enter than
+a straddle (since OTM options cost less), but needs a bigger move to turn profitable,
+since there's a "dead zone" between the two strikes where both legs expire worthless.
+
+**Why these don't have a "max profit" like verticals/butterflies**: a vertical or
+butterfly has a hard payoff cap built into its structure. A straddle/strangle doesn't
+-- the more the stock moves, the more it makes, with no ceiling on the call side. Since
+the screener's EV math needs *some* payoff number to work with, it estimates what
+you'd make if the stock moves by one "expected move" (a standard IV-derived move size)
+in either direction, and uses that as a stand-in for ranking purposes. This is
+explicitly an approximation for comparing setups against each other -- not a cap on
+what you could actually make, and not a precise price target either.
+
+**One subtlety worth knowing**: that expected-move estimate is calculated from the
+stock's *realized* volatility, not the option's own (cheap) implied volatility. Using
+the same underpriced IV to both price the trade and estimate its payoff would be
+circular -- the whole thesis for buying a straddle when IV is cheap is that the stock
+tends to move more than the option market is currently pricing in.
+
 ---
 
 *This guide will grow over time as new concepts come up -- treat it as a living

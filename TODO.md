@@ -30,10 +30,12 @@ rushing architecture changes late in a long session.
         against known payoff shapes) and a calibration report that breaks out bull
         call / bear put / butterfly separately.
   - [x] `USER_GUIDE.md` and `README.md` updated to explain regime-based dispatch.
-  - [ ] Straddles/strangles -- when they make sense (expecting a big move, direction
-        unknown -- earnings, catalysts) and how to score them. Natural next use of the
-        IV-richness signal (cheap IV = premium looks underpriced = good time to buy a
-        straddle betting on movement).
+  - [x] Straddles/strangles -- implemented and tested. Triggers on neutral trend +
+        cheap IV (options underpriced relative to the stock's own realized volatility).
+        Uses realized vol (not the cheap option IV itself) to estimate expected payoff,
+        avoiding a circular "cheap IV makes it look cheap to buy AND cheap to profit"
+        trap. Backtest schema, grading math, and calibration report all updated and
+        tested for both new types.
   - [ ] Calendar spreads -- when they make sense (expecting low near-term movement,
         benefiting from time decay differences between expirations).
   - [ ] Single-leg calls/puts -- when a defined-risk spread isn't actually the better

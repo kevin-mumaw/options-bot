@@ -783,7 +783,11 @@ def run_bulk_screener(progress=print):
     if not top_butterflies:
         summary += "=== TOP BUTTERFLY PINS ===\nNone found with positive estimated EV today.\n\n"
     summary += format_setup_list(top_straddles, "=== TOP LONG STRADDLES (1 per ticker, positive EV only) ===")
+    if not top_straddles:
+        summary += "=== TOP LONG STRADDLES ===\nNone found with positive estimated EV today.\n\n"
     summary += format_setup_list(top_strangles, "=== TOP LONG STRANGLES (1 per ticker, positive EV only) ===")
+    if not top_strangles:
+        summary += "=== TOP LONG STRANGLES ===\nNone found with positive estimated EV today.\n\n"
     return summary
 
 if __name__ == "__main__":

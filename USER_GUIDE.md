@@ -161,6 +161,40 @@ weeks to hit max profit -- the screener's own estimate put this around 27% proba
 of profit. That's not a high-confidence setup; it's a small-cost, positive-EV longshot.
 Worth remembering what kind of bet you're actually making, not just the payout ratio.
 
+## 9. How the screener picks a strategy for each ticker (regime detection)
+
+As of this update, the screener no longer treats every ticker the same way. For each
+ticker, it classifies a **trend regime** using free price history, and dispatches to a
+different strategy depending on what it finds:
+
+| Trend | Signal | Strategy scanned |
+|---|---|---|
+| Bullish | Price > rising 20-day SMA > 50-day SMA | Bull call vertical (buy lower call, sell higher call) |
+| Bearish | Price < falling 20-day SMA < 50-day SMA | Bear put vertical (buy higher put, sell lower put) |
+| Neutral | Neither of the above cleanly | Butterfly (unchanged from before) |
+
+**Bear put verticals** are the mirror image of the bull call verticals you've already
+seen: you buy the higher-strike put and sell the lower-strike put, profiting as the
+stock falls. Max profit happens if the stock closes at or below the *short* (lower)
+strike at expiration -- same shape as a bull call vertical, just flipped and using puts.
+
+**Why this matters**: before this update, the screener could *only* find bullish
+trades -- it would suggest a bull call vertical even on a ticker in a clear downtrend,
+which never made sense. Now a downtrending ticker gets scanned for bear put verticals
+instead, and an uptrending ticker still gets bull call verticals. Neutral/choppy names
+still go to butterflies, unchanged.
+
+**The `[BULLISH]` / `[BEARISH]` / `[NEUTRAL]` tag** at the start of each setup's
+description tells you which regime triggered that particular trade -- worth reading
+before you act on it, since a bearish tag means the whole thesis is "this stock keeps
+falling," not "this stock rises."
+
+**A second signal is also computed but not yet used to pick strategies**: whether
+current implied volatility is "rich," "cheap," or "fair" relative to the stock's own
+recent realized volatility. This is the foundation for adding straddles/strangles
+later (cheap IV + expecting a big move = attractive to buy premium) -- not wired into
+strategy selection yet, just being calculated and logged for now.
+
 ---
 
 *This guide will grow over time as new concepts come up -- treat it as a living

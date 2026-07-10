@@ -20,10 +20,19 @@ import yfinance as yf
 LOG_FILE = "backtest_log.csv"
 
 
-def vertical_payoff(spot_at_exp, long_strike, short_strike):
-    """Payoff of a long call debit vertical at expiration (per share)."""
+def call_vertical_payoff(spot_at_exp, long_strike, short_strike):
+    """Payoff of a long call debit vertical (bull call spread) at expiration (per share)."""
     long_value = max(0.0, spot_at_exp - long_strike)
     short_value = max(0.0, spot_at_exp - short_strike)
+    return long_value - short_value
+
+
+def put_vertical_payoff(spot_at_exp, long_strike, short_strike):
+    """Payoff of a long put debit vertical (bear put spread) at expiration (per share).
+    long_strike is the higher (bought) strike, short_strike is the lower (sold) strike --
+    profit increases as the stock falls."""
+    long_value = max(0.0, long_strike - spot_at_exp)
+    short_value = max(0.0, short_strike - spot_at_exp)
     return long_value - short_value
 
 
@@ -78,7 +87,11 @@ def grade_log(log_file=LOG_FILE):
 
         net_cost = float(row["net_cost"])
         if row["type"] == "Debit Vertical":
-            payoff = vertical_payoff(spot_at_exp, float(row["long_strike"]), float(row["short_strike"]))
+            option_type = (row.get("option_type") or "call").strip().lower()  # old rows default to call
+            if option_type == "put":
+                payoff = put_vertical_payoff(spot_at_exp, float(row["long_strike"]), float(row["short_strike"]))
+            else:
+                payoff = call_vertical_payoff(spot_at_exp, float(row["long_strike"]), float(row["short_strike"]))
         elif row["type"] == "Butterfly Pin":
             payoff = butterfly_payoff(spot_at_exp, float(row["low_strike"]), float(row["mid_strike"]), float(row["high_strike"]))
         else:
@@ -112,22 +125,28 @@ def print_calibration_report(rows):
     print("CALIBRATION REPORT")
     print("=" * 60)
 
-    for setup_type in ("Debit Vertical", "Butterfly Pin"):
-        subset = [r for r in graded if r["type"] == setup_type]
+    buckets = [
+        ("Bull Call Verticals", lambda r: r["type"] == "Debit Vertical" and (r.get("direction") or "bullish") == "bullish"),
+        ("Bear Put Verticals", lambda r: r["type"] == "Debit Vertical" and r.get("direction") == "bearish"),
+        ("Butterflies (Neutral)", lambda r: r["type"] == "Butterfly Pin"),
+    ]
+
+    for label, match_fn in buckets:
+        subset = [r for r in graded if match_fn(r)]
         if not subset:
             continue
         wins = [r for r in subset if r["win"] == "yes"]
         avg_pnl = sum(float(r["actual_pnl"]) for r in subset) / len(subset)
         avg_predicted_prob = sum(float(r["prob_profit"]) for r in subset) / len(subset)
         actual_win_rate = len(wins) / len(subset)
-        print(f"\n{setup_type} (n={len(subset)}):")
+        print(f"\n{label} (n={len(subset)}):")
         print(f"  Avg predicted probability of profit: {avg_predicted_prob*100:.1f}%")
         print(f"  Actual win rate:                      {actual_win_rate*100:.1f}%")
         print(f"  Average P/L per contract:              ${avg_pnl:+.2f}")
         gap = (actual_win_rate - avg_predicted_prob) * 100
         if abs(gap) > 15:
-            direction = "overconfident" if gap < 0 else "underconfident"
-            print(f"  --> Model looks {direction} by ~{abs(gap):.0f} points on this type.")
+            calibration_direction = "overconfident" if gap < 0 else "underconfident"
+            print(f"  --> Model looks {calibration_direction} by ~{abs(gap):.0f} points on this type.")
         else:
             print(f"  --> Reasonably well calibrated (within 15 points).")
 

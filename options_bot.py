@@ -61,7 +61,7 @@ MIN_PRICE = 10.0             # skip penny-priced noise
 
 BACKTEST_LOG_FILE = "backtest_log.csv"
 BACKTEST_LOG_COLUMNS = [
-    "run_date", "ticker", "type", "expiration", "spot_at_scan",
+    "run_date", "ticker", "type", "option_type", "direction", "expiration", "spot_at_scan",
     "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
     "net_cost", "max_profit", "prob_profit", "ev",
     "graded", "actual_spot_at_exp", "actual_payoff", "actual_pnl", "win"
@@ -243,6 +243,58 @@ def prob_finish_above(spot, strike, iv, days_to_exp):
     T = days_to_exp / 365.0
     d2 = (math.log(spot / strike) - 0.5 * iv * iv * T) / (iv * math.sqrt(T))
     return 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
+
+def detect_regime(ticker, current_iv, price_history=None):
+    """Classifies a ticker's regime using only free data:
+    - trend: 'bullish' / 'bearish' / 'neutral', from price vs. 20/50-day SMAs and whether
+      the 20-day SMA is rising or falling
+    - iv_regime: 'rich' / 'cheap' / 'fair' / 'unknown', from current IV vs. realized
+      volatility computed from recent price history. This sidesteps the need for paid
+      historical IV/IV-rank data entirely -- it only needs the CURRENT option IV (which
+      we already pull from Tradier) and historical STOCK prices (free via yfinance).
+    Returns None if there isn't enough price history to classify confidently.
+    `price_history` can be injected for testing; otherwise pulled live via yfinance."""
+    if price_history is None:
+        price_history = yf.Ticker(ticker).history(period="4mo")
+    if price_history is None or len(price_history) < 55:
+        return None
+
+    closes = price_history['Close']
+    current_price = closes.iloc[-1]
+    sma20_series = closes.rolling(20).mean()
+    sma20 = sma20_series.iloc[-1]
+    sma20_prior = sma20_series.iloc[-6]  # ~1 trading week earlier, for slope direction
+    sma50 = closes.rolling(50).mean().iloc[-1]
+    sma20_rising = sma20 > sma20_prior
+
+    if current_price > sma20 > sma50 and sma20_rising:
+        trend = "bullish"
+    elif current_price < sma20 < sma50 and not sma20_rising:
+        trend = "bearish"
+    else:
+        trend = "neutral"
+
+    daily_returns = closes.pct_change().dropna().iloc[-21:]  # ~last 20 trading days
+    realized_vol = daily_returns.std() * math.sqrt(252) if len(daily_returns) >= 5 else None
+
+    iv_rv_ratio = None
+    if realized_vol and realized_vol > 0 and current_iv and current_iv > 0:
+        iv_rv_ratio = current_iv / realized_vol
+        if iv_rv_ratio >= 1.3:
+            iv_regime = "rich"    # options pricier than recent actual movement justifies
+        elif iv_rv_ratio <= 0.8:
+            iv_regime = "cheap"   # options cheaper than recent actual movement -- premium looks underpriced
+        else:
+            iv_regime = "fair"
+    else:
+        iv_regime = "unknown"
+
+    return {
+        "trend": trend, "iv_regime": iv_regime, "iv_rv_ratio": iv_rv_ratio,
+        "realized_vol": realized_vol, "current_price": current_price,
+        "sma20": sma20, "sma50": sma50,
+    }
+
 def get_tradier_quote(symbol, headers):
     res = requests.get(f"{TRADIER_BASE_URL}/markets/quotes",
                         params={"symbols": symbol}, headers=headers, timeout=10).json()
@@ -449,7 +501,10 @@ def generate_narrative(pos):
     return " ".join(lines)
 
 def scan_single_ticker(ticker):
-    """Pulls option chains via Tradier."""
+    """Pulls option chains via Tradier, detects the ticker's regime (trend + IV
+    richness), and dispatches to the strategy that regime calls for: bull call
+    verticals in an uptrend, bear put verticals in a downtrend, butterflies when
+    neutral."""
     setups = []
     token = os.getenv("TRADIER_API_KEY")
     if not token: return setups
@@ -479,35 +534,43 @@ def scan_single_ticker(ticker):
         if isinstance(options, dict): options = [options]  # Tradier returns a dict instead of a list when there's only one contract
         if not options: return setups
 
-        contracts_list = []
+        calls_list, puts_list = [], []
         for opt in options:
-            if opt.get('option_type') != 'call': continue
             greeks = opt.get('greeks') or {}
             iv = greeks.get('mid_iv') or greeks.get('smv_vol') or 0.35
-            contracts_list.append({
-                'strike': opt.get('strike'),
-                'expiration': target_date,
-                'bid': opt.get('bid') or 0,
-                'ask': opt.get('ask') or 0,
-                'openInterest': opt.get('open_interest') or 0,
-                'impliedVolatility': iv
-            })
+            row = {
+                'strike': opt.get('strike'), 'expiration': target_date,
+                'bid': opt.get('bid') or 0, 'ask': opt.get('ask') or 0,
+                'openInterest': opt.get('open_interest') or 0, 'impliedVolatility': iv
+            }
+            if opt.get('option_type') == 'call':
+                calls_list.append(row)
+            elif opt.get('option_type') == 'put':
+                puts_list.append(row)
 
-        calls = pd.DataFrame(contracts_list)
-        if calls.empty: return setups
+        calls = filter_contract_liquidity(pd.DataFrame(calls_list))
+        puts = filter_contract_liquidity(pd.DataFrame(puts_list))
+        if calls.empty and puts.empty: return setups
 
-        calls = filter_contract_liquidity(calls)
-        if calls.empty: return setups
-        
-        calls = calls.sort_values('strike').reset_index(drop=True)
         step_size = 5.0 if spot > 250 else (2.5 if spot > 100 else 1.0)
-        atm_calls = calls[(calls['strike'] >= spot * 0.90) & (calls['strike'] <= spot * 1.10)].copy()
-        
-        if not check_volatility_environment(atm_calls): return setups
-        
-        days_to_exp = (datetime.strptime(target_date, "%Y-%m-%d") - datetime.now()).days
+        atm_calls = pd.DataFrame()
+        if not calls.empty:
+            calls = calls.sort_values('strike').reset_index(drop=True)
+            atm_calls = calls[(calls['strike'] >= spot * 0.90) & (calls['strike'] <= spot * 1.10)].copy()
+        atm_puts = pd.DataFrame()
+        if not puts.empty:
+            puts = puts.sort_values('strike').reset_index(drop=True)
+            atm_puts = puts[(puts['strike'] >= spot * 0.90) & (puts['strike'] <= spot * 1.10)].copy()
 
-        if len(atm_calls) >= 2:
+        if not check_volatility_environment(atm_calls): return setups
+
+        days_to_exp = (datetime.strptime(target_date, "%Y-%m-%d") - datetime.now()).days
+        avg_iv_for_regime = atm_calls['impliedVolatility'].mean() if not atm_calls.empty else 0
+        regime = detect_regime(ticker, current_iv=avg_iv_for_regime)
+        if regime is None: return setups
+        trend = regime["trend"]
+
+        if trend == "bullish" and len(atm_calls) >= 2:
             for idx in range(len(atm_calls) - 1):
                 long_leg = atm_calls.iloc[idx].to_dict()
                 short_leg = atm_calls.iloc[idx + 1].to_dict()
@@ -519,20 +582,41 @@ def scan_single_ticker(ticker):
                     breakeven = long_leg['strike'] + net_debit
                     avg_iv = (long_leg['impliedVolatility'] + short_leg['impliedVolatility']) / 2
                     prob_profit = prob_finish_above(spot, breakeven, avg_iv, days_to_exp)
-                    # Binary approximation: treats the payoff as all-or-nothing at breakeven,
-                    # which overstates EV since real profit ramps linearly between breakeven
-                    # and the short strike -- good enough for ranking, not a precise price.
                     ev = prob_profit * max_profit - (1 - prob_profit) * net_debit
                     setups.append({
-                        "ticker": ticker, "type": "Debit Vertical", "score": max_profit / net_debit,
-                        "prob_profit": prob_profit, "ev": ev,
+                        "ticker": ticker, "type": "Debit Vertical", "option_type": "call", "direction": "bullish",
+                        "score": max_profit / net_debit, "prob_profit": prob_profit, "ev": ev,
                         "expiration": target_date, "spot_at_scan": spot,
                         "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
                         "net_cost": net_debit, "max_profit": max_profit,
-                        "desc": f"BUY ${long_leg['strike']} C / SELL ${short_leg['strike']} C (Cost: ${net_debit:.2f} | Max Gain: ${max_profit:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                        "desc": f"[BULLISH] BUY ${long_leg['strike']} C / SELL ${short_leg['strike']} C (Cost: ${net_debit:.2f} | Max Gain: ${max_profit:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                     })
-                    
-        if len(atm_calls) >= 3:
+
+        elif trend == "bearish" and len(atm_puts) >= 2:
+            for idx in range(len(atm_puts) - 1):
+                # Bear put vertical: BUY the higher strike, SELL the lower strike --
+                # mirror image of the bull call vertical above.
+                short_leg = atm_puts.iloc[idx].to_dict()      # lower strike, sold
+                long_leg = atm_puts.iloc[idx + 1].to_dict()   # higher strike, bought
+                strike_width = long_leg['strike'] - short_leg['strike']
+                if abs(strike_width - step_size) > 0.1: continue
+                net_debit = long_leg['ask'] - short_leg['bid']
+                max_profit = strike_width - net_debit
+                if 0.15 < net_debit <= 4.00 and max_profit >= (net_debit * 2.0):
+                    breakeven = long_leg['strike'] - net_debit
+                    avg_iv = (long_leg['impliedVolatility'] + short_leg['impliedVolatility']) / 2
+                    prob_profit = 1 - prob_finish_above(spot, breakeven, avg_iv, days_to_exp)  # profit if stock finishes BELOW breakeven
+                    ev = prob_profit * max_profit - (1 - prob_profit) * net_debit
+                    setups.append({
+                        "ticker": ticker, "type": "Debit Vertical", "option_type": "put", "direction": "bearish",
+                        "score": max_profit / net_debit, "prob_profit": prob_profit, "ev": ev,
+                        "expiration": target_date, "spot_at_scan": spot,
+                        "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
+                        "net_cost": net_debit, "max_profit": max_profit,
+                        "desc": f"[BEARISH] BUY ${long_leg['strike']} P / SELL ${short_leg['strike']} P (Cost: ${net_debit:.2f} | Max Gain: ${max_profit:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                    })
+
+        elif trend == "neutral" and len(atm_calls) >= 3:
             for idx in range(len(atm_calls) - 2):
                 low_leg = atm_calls.iloc[idx].to_dict()
                 mid_leg = atm_calls.iloc[idx + 1].to_dict()
@@ -545,23 +629,16 @@ def scan_single_ticker(ticker):
                         breakeven_low = low_leg['strike'] + net_cost
                         breakeven_high = high_leg['strike'] - net_cost
                         avg_iv = (low_leg['impliedVolatility'] + mid_leg['impliedVolatility'] + high_leg['impliedVolatility']) / 3
-                        # Probability the stock finishes anywhere in the profit zone (between
-                        # the two breakevens), not just probability of hitting max profit at
-                        # the exact center strike -- max profit is a single point, so its
-                        # standalone probability is ~0 in a continuous model.
                         prob_profit = prob_finish_above(spot, breakeven_low, avg_iv, days_to_exp) - prob_finish_above(spot, breakeven_high, avg_iv, days_to_exp)
                         prob_profit = max(0.0, prob_profit)
-                        # Binary approximation using max profit -- real payoff tapers linearly
-                        # from the breakevens to a peak at the center strike, so this overstates
-                        # EV. Useful for ranking/comparison, not a precise fair value.
                         ev = prob_profit * max_bfly_profit - (1 - prob_profit) * net_cost
                         setups.append({
-                            "ticker": ticker, "type": "Butterfly Pin", "score": max_bfly_profit / net_cost,
-                            "prob_profit": prob_profit, "ev": ev,
+                            "ticker": ticker, "type": "Butterfly Pin", "option_type": "call", "direction": "neutral",
+                            "score": max_bfly_profit / net_cost, "prob_profit": prob_profit, "ev": ev,
                             "expiration": target_date, "spot_at_scan": spot,
                             "low_strike": low_leg['strike'], "mid_strike": mid_leg['strike'], "high_strike": high_leg['strike'],
                             "net_cost": net_cost, "max_profit": max_bfly_profit,
-                            "desc": f"Pin Target ${mid_leg['strike']} (${low_leg['strike']}/{mid_leg['strike']}/{high_leg['strike']}) (Cost: ${net_cost:.2f} | Max Gain: ${max_bfly_profit:.2f}) | Exp: {target_date} | Est. Prob. in Profit Zone: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                            "desc": f"[NEUTRAL] Pin Target ${mid_leg['strike']} (${low_leg['strike']}/{mid_leg['strike']}/{high_leg['strike']}) (Cost: ${net_cost:.2f} | Max Gain: ${max_bfly_profit:.2f}) | Exp: {target_date} | Est. Prob. in Profit Zone: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                         })
     except Exception as e:
         print(f" [!] {ticker}: {e}")
@@ -641,4 +718,4 @@ if __name__ == "__main__":
     elif choice == "2":
         print(run_bulk_screener())
     else:
-        print("Invalid choice selected.")
+        print("Invalid choice selected.")s

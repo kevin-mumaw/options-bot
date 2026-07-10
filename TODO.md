@@ -8,38 +8,41 @@ rushing architecture changes late in a long session.
 
 - [ ] **Strategy selection by market regime** -- the big one. Currently the tool only
   scans two strategies (debit verticals, butterflies), both of which assume a specific
-  market view. Need to figure out:
-  - [ ] How to detect market regime per ticker: bullish / bearish / neutral / high-volatility
-        / low-volatility. Candidates: realized vs. implied volatility comparison, price vs.
-        moving averages, IV rank/percentile (needs historical IV, which is a data-source
-        question -- see note below).
+  market view. Progress so far:
+  - [x] How to detect market regime per ticker: bullish / bearish / neutral, from price
+        vs. 20/50-day SMAs (trend direction and slope). Also computing IV-vs-realized-
+        volatility richness (rich/cheap/fair) as a second signal -- calculated and
+        logged, but not yet wired into strategy selection.
+  - [x] Data question resolved: IV rank/percentile would need paid historical IV data,
+        so instead we compare CURRENT IV (free, already pulled) against REALIZED
+        volatility from free historical stock prices. Sidesteps the paid-data wall
+        entirely for this purpose.
+  - [x] Bear put verticals -- implemented and tested. Screener now finds bearish trades
+        for the first time (previously it could only ever suggest bullish call
+        verticals, even on tickers in a clear downtrend).
+  - [x] Architecture: `scan_single_ticker()` now detects regime once per ticker and
+        dispatches to bull call verticals / bear put verticals / butterflies
+        accordingly, instead of always attempting all strategies on every ticker.
+  - [x] Backtest log schema extended (`option_type`, `direction` columns) with a
+        tested, idempotent one-time migration script (`migrate_backtest_log.py`) for
+        existing log files.
+  - [x] `grade_backtest.py` updated with correct put-vertical payoff math (verified
+        against known payoff shapes) and a calibration report that breaks out bull
+        call / bear put / butterfly separately.
+  - [x] `USER_GUIDE.md` and `README.md` updated to explain regime-based dispatch.
   - [ ] Straddles/strangles -- when they make sense (expecting a big move, direction
-        unknown -- earnings, catalysts) and how to score them.
+        unknown -- earnings, catalysts) and how to score them. Natural next use of the
+        IV-richness signal (cheap IV = premium looks underpriced = good time to buy a
+        straddle betting on movement).
   - [ ] Calendar spreads -- when they make sense (expecting low near-term movement,
         benefiting from time decay differences between expirations).
   - [ ] Single-leg calls/puts -- when a defined-risk spread isn't actually the better
         trade vs. a naked directional bet (rare for this tool's EV-focused approach, but
         worth defining explicitly rather than defaulting to "always use a spread").
-  - [ ] Decision logic: given a ticker's regime, which strategy type(s) should the
-        screener even attempt for it? (E.g., don't scan for bearish put verticals on a
-        ticker in a strong uptrend, don't scan calendars against a name with no
-        near-term catalyst.)
-  - [ ] Architecture: how new strategy types plug into `scan_single_ticker()` --
-        probably needs to become a dispatcher that calls per-strategy scan functions
-        based on detected regime, rather than one function doing everything.
-  - [ ] Data question: some regime signals (IV rank/percentile specifically) need
-        *historical* IV, which Tradier doesn't provide for free -- same constraint we
-        hit with the backtest. May need to approximate with realized volatility instead,
-        or scope a paid data source later.
-  - [ ] Backtest log schema: `backtest_log.csv` columns are vertical/butterfly-specific
-        right now (`long_strike`, `short_strike`, `low_strike`/`mid_strike`/`high_strike`).
-        New strategy types need this schema extended without breaking existing grading.
   - [ ] Streamlit app: Screener tab currently shows two fixed sections (verticals,
-        butterflies). Needs to accommodate however many strategy types end up
-        implemented, cleanly.
-  - [ ] `USER_GUIDE.md`: new section(s) explaining each new strategy -- when it's used,
-        how to read its output, same style as the existing vertical/butterfly sections.
-  - [ ] `README.md`: update "What it does" section once new strategies are live.
+        butterflies). The `[BULLISH]`/`[BEARISH]`/`[NEUTRAL]` tags in each setup's
+        description cover this for now, but once straddles/calendars exist, may need
+        dedicated sections rather than relying on tags alone.
 
 ## Completed
 

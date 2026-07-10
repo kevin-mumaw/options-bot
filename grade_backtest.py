@@ -56,6 +56,16 @@ def strangle_payoff(spot_at_exp, call_strike, put_strike):
     return max(0.0, spot_at_exp - call_strike) + max(0.0, put_strike - spot_at_exp)
 
 
+def long_call_payoff(spot_at_exp, strike):
+    """Payoff of a long call at expiration."""
+    return max(0.0, spot_at_exp - strike)
+
+
+def long_put_payoff(spot_at_exp, strike):
+    """Payoff of a long put at expiration."""
+    return max(0.0, strike - spot_at_exp)
+
+
 def get_closing_price_near(ticker, date_str):
     """Pulls the stock's closing price on the given date, falling back to the nearest
     prior trading day within a week if the exact date isn't a trading day (holiday, etc)."""
@@ -108,6 +118,10 @@ def grade_log(log_file=LOG_FILE):
             payoff = straddle_payoff(spot_at_exp, float(row["strike"]))
         elif row["type"] == "Long Strangle":
             payoff = strangle_payoff(spot_at_exp, float(row["call_strike"]), float(row["put_strike"]))
+        elif row["type"] == "Long Call":
+            payoff = long_call_payoff(spot_at_exp, float(row["strike"]))
+        elif row["type"] == "Long Put":
+            payoff = long_put_payoff(spot_at_exp, float(row["strike"]))
         else:
             continue
 
@@ -145,6 +159,8 @@ def print_calibration_report(rows):
         ("Butterflies (Neutral)", lambda r: r["type"] == "Butterfly Pin"),
         ("Long Straddles (Neutral, Cheap IV)", lambda r: r["type"] == "Long Straddle"),
         ("Long Strangles (Neutral, Cheap IV)", lambda r: r["type"] == "Long Strangle"),
+        ("Long Calls (Bullish, Cheap IV)", lambda r: r["type"] == "Long Call"),
+        ("Long Puts (Bearish, Cheap IV)", lambda r: r["type"] == "Long Put"),
     ]
 
     for label, match_fn in buckets:

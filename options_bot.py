@@ -589,7 +589,29 @@ def scan_single_ticker(ticker):
         if regime is None: return setups
         trend = regime["trend"]
 
-        if trend == "bullish" and len(atm_calls) >= 2:
+        if trend == "bullish" and regime["iv_regime"] == "cheap" and not atm_calls.empty:
+            # IV cheap -- the premium we'd sell to build a vertical isn't attractively
+            # priced, so we give up the cost discount and just buy the call outright to
+            # keep the uncapped upside instead.
+            leg_row = atm_calls.iloc[(atm_calls['strike'] - spot).abs().argsort().iloc[0]].to_dict()
+            strike = leg_row['strike']
+            cost = leg_row['ask']
+            breakeven = strike + cost
+            avg_iv = leg_row['impliedVolatility']
+            prob_profit = prob_finish_above(spot, breakeven, avg_iv, days_to_exp)
+            em = expected_move(spot, regime["realized_vol"], days_to_exp)
+            assumed_payoff = max(0.0, max(0.0, (spot + em) - strike) - cost)
+            if 0.15 < cost <= 4.00 and assumed_payoff >= (cost * 2.0):
+                ev = prob_profit * assumed_payoff - (1 - prob_profit) * cost
+                setups.append({
+                    "ticker": ticker, "type": "Long Call", "option_type": "call", "direction": "bullish",
+                    "score": assumed_payoff / cost, "prob_profit": prob_profit, "ev": ev,
+                    "expiration": target_date, "spot_at_scan": spot, "strike": strike,
+                    "net_cost": cost, "max_profit": assumed_payoff,
+                    "desc": f"[BULLISH/CHEAP IV] BUY ${strike} C (Cost: ${cost:.2f} | Est. Payoff @ ~1SD move: ${assumed_payoff:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                })
+
+        elif trend == "bullish" and len(atm_calls) >= 2:
             for idx in range(len(atm_calls) - 1):
                 long_leg = atm_calls.iloc[idx].to_dict()
                 short_leg = atm_calls.iloc[idx + 1].to_dict()
@@ -610,6 +632,25 @@ def scan_single_ticker(ticker):
                         "net_cost": net_debit, "max_profit": max_profit,
                         "desc": f"[BULLISH] BUY ${long_leg['strike']} C / SELL ${short_leg['strike']} C (Cost: ${net_debit:.2f} | Max Gain: ${max_profit:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
                     })
+
+        elif trend == "bearish" and regime["iv_regime"] == "cheap" and not atm_puts.empty:
+            leg_row = atm_puts.iloc[(atm_puts['strike'] - spot).abs().argsort().iloc[0]].to_dict()
+            strike = leg_row['strike']
+            cost = leg_row['ask']
+            breakeven = strike - cost
+            avg_iv = leg_row['impliedVolatility']
+            prob_profit = 1 - prob_finish_above(spot, breakeven, avg_iv, days_to_exp)
+            em = expected_move(spot, regime["realized_vol"], days_to_exp)
+            assumed_payoff = max(0.0, max(0.0, strike - (spot - em)) - cost)
+            if 0.15 < cost <= 4.00 and assumed_payoff >= (cost * 2.0):
+                ev = prob_profit * assumed_payoff - (1 - prob_profit) * cost
+                setups.append({
+                    "ticker": ticker, "type": "Long Put", "option_type": "put", "direction": "bearish",
+                    "score": assumed_payoff / cost, "prob_profit": prob_profit, "ev": ev,
+                    "expiration": target_date, "spot_at_scan": spot, "strike": strike,
+                    "net_cost": cost, "max_profit": assumed_payoff,
+                    "desc": f"[BEARISH/CHEAP IV] BUY ${strike} P (Cost: ${cost:.2f} | Est. Payoff @ ~1SD move: ${assumed_payoff:.2f}) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                })
 
         elif trend == "bearish" and len(atm_puts) >= 2:
             for idx in range(len(atm_puts) - 1):
@@ -767,13 +808,17 @@ def run_bulk_screener(progress=print):
     butterflies = [s for s in all_setups if s['type'] == 'Butterfly Pin' and s['ev'] > 0]
     straddles = [s for s in all_setups if s['type'] == 'Long Straddle' and s['ev'] > 0]
     strangles = [s for s in all_setups if s['type'] == 'Long Strangle' and s['ev'] > 0]
+    long_calls = [s for s in all_setups if s['type'] == 'Long Call' and s['ev'] > 0]
+    long_puts = [s for s in all_setups if s['type'] == 'Long Put' and s['ev'] > 0]
 
     top_verticals = sorted(dedupe_best_per_ticker(verticals), key=lambda x: x['ev'], reverse=True)[:3]
     top_butterflies = sorted(dedupe_best_per_ticker(butterflies), key=lambda x: x['ev'], reverse=True)[:3]
     top_straddles = sorted(dedupe_best_per_ticker(straddles), key=lambda x: x['ev'], reverse=True)[:3]
     top_strangles = sorted(dedupe_best_per_ticker(strangles), key=lambda x: x['ev'], reverse=True)[:3]
+    top_long_calls = sorted(dedupe_best_per_ticker(long_calls), key=lambda x: x['ev'], reverse=True)[:3]
+    top_long_puts = sorted(dedupe_best_per_ticker(long_puts), key=lambda x: x['ev'], reverse=True)[:3]
 
-    if not any([top_verticals, top_butterflies, top_straddles, top_strangles]):
+    if not any([top_verticals, top_butterflies, top_straddles, top_strangles, top_long_calls, top_long_puts]):
         return "No positive-expected-value setups identified across the universe today. That's a legitimate result, not an error -- it means nothing in today's liquid universe cleared the bar once probability of profit is factored in."
 
     summary = format_setup_list(top_verticals, "=== TOP DEBIT VERTICALS (1 per ticker, positive EV only) ===")
@@ -788,6 +833,12 @@ def run_bulk_screener(progress=print):
     summary += format_setup_list(top_strangles, "=== TOP LONG STRANGLES (1 per ticker, positive EV only) ===")
     if not top_strangles:
         summary += "=== TOP LONG STRANGLES ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_long_calls, "=== TOP LONG CALLS (1 per ticker, positive EV only) ===")
+    if not top_long_calls:
+        summary += "=== TOP LONG CALLS ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_long_puts, "=== TOP LONG PUTS (1 per ticker, positive EV only) ===")
+    if not top_long_puts:
+        summary += "=== TOP LONG PUTS ===\nNone found with positive estimated EV today.\n\n"
     return summary
 
 if __name__ == "__main__":

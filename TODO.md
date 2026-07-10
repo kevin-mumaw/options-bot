@@ -1,5 +1,8 @@
 # Options Intelligence Desk — To-Do List
 
+**Working preference (2026-07-10): always give the straight, unvarnished answer on
+this project — no sugarcoating, especially on model accuracy/confidence questions.**
+
 Running list of planned work. Check items off as they're completed; add new ones as they
 come up. Each item should get its own focused session when it's substantial -- avoid
 rushing architecture changes late in a long session.
@@ -36,15 +39,18 @@ rushing architecture changes late in a long session.
         avoiding a circular "cheap IV makes it look cheap to buy AND cheap to profit"
         trap. Backtest schema, grading math, and calibration report all updated and
         tested for both new types.
+  - [x] Single-leg calls/puts -- implemented and tested. Triggers on bullish/bearish
+        trend + cheap IV, replacing the vertical entirely rather than running alongside
+        it: when the premium you'd sell to build a spread is cheap, the discount isn't
+        worth giving up uncapped upside for. No new backtest schema needed -- reused
+        the `strike`/`option_type`/`direction` columns already added for straddles.
   - [ ] Calendar spreads -- when they make sense (expecting low near-term movement,
-        benefiting from time decay differences between expirations).
-  - [ ] Single-leg calls/puts -- when a defined-risk spread isn't actually the better
-        trade vs. a naked directional bet (rare for this tool's EV-focused approach, but
-        worth defining explicitly rather than defaulting to "always use a spread").
-  - [ ] Streamlit app: Screener tab currently shows two fixed sections (verticals,
-        butterflies). The `[BULLISH]`/`[BEARISH]`/`[NEUTRAL]` tags in each setup's
-        description cover this for now, but once straddles/calendars exist, may need
-        dedicated sections rather than relying on tags alone.
+        benefiting from time decay differences between expirations). This is the last
+        planned strategy type for this phase.
+  - [ ] Streamlit app: Screener tab now has SIX possible section types (verticals,
+        butterflies, straddles, strangles, long calls, long puts). The tagged text
+        format still works but is getting long -- consider whether the mobile view
+        needs a more compact/collapsible layout once calendars are added too.
 
 ## Completed
 
@@ -61,8 +67,25 @@ rushing architecture changes late in a long session.
 - [x] Purchase details (strikes, expiration, contracts, entry cost) shown per position on mobile
 - [x] `USER_GUIDE.md` started -- pin risk, GTC vs. price alerts, closing for max profit,
       early assignment risk
+- [x] GitHub profile README updated with options-bot listed under Quantitative Trading
 
 ## Backlog (not started)
 
-- [ ] Update GitHub profile README (the profile-level one, not this project's)
 - [ ] Decide: track `backtest_log.csv` in git — **decided: yes** (see completed)
+- [ ] Improve probability-of-profit trustworthiness. Discussed 2026-07-10: raw Black-
+      Scholes probability estimates aren't necessarily well-calibrated (options IV
+      tends to run a bit higher than realized volatility on average, which could bias
+      probabilities in a predictable direction). Two candidate fixes:
+      1. Add a minimum probability-of-profit threshold so longshots stop surfacing as
+         "top picks" just because EV is technically positive -- straightforward, no
+         data dependency, but only changes *what gets shown*, not the underlying
+         accuracy of the estimate itself.
+      2. Apply a documented volatility-risk-premium correction to the raw IV before
+         estimating probabilities -- addresses the actual estimate, but is a real
+         statistical claim that ideally needs backtest validation before/after
+         applying it, or risks trading one unverified bias for another.
+      **Decided to wait for real backtest calibration data before doing either** --
+      once `grade_backtest.py` has enough graded setups (dozens per strategy type,
+      ideally more), the calibration report will show whether there's a real,
+      measurable gap between predicted and actual win rates, and by how much --
+      turning this from a guess into an evidence-based fix.

@@ -233,6 +233,37 @@ the same underpriced IV to both price the trade and estimate its payoff would be
 circular -- the whole thesis for buying a straddle when IV is cheap is that the stock
 tends to move more than the option market is currently pricing in.
 
+## 11. Single-leg calls/puts -- when the screener skips the spread entirely
+
+The same cheap-IV logic that triggers straddles/strangles on neutral tickers now also
+applies to trending tickers. A vertical spread's whole appeal is that selling the
+opposite leg lowers your cost -- but that discount only means something if the premium
+you're selling is actually worth something. When IV is cheap, the premium you'd be
+selling is cheap too, so you're giving up your uncapped upside for a discount that
+isn't worth much. In that case, the screener buys the single leg outright instead.
+
+**Full picture, all three trend states:**
+
+| Trend | IV rich or fair | IV cheap |
+|---|---|---|
+| Bullish | Bull call vertical | **Long call** (uncapped upside, costs more) |
+| Bearish | Bear put vertical | **Long put** (uncapped downside profit, costs more) |
+| Neutral | Butterfly | Long straddle / long strangle |
+
+**What changes in practice**: a bullish or bearish ticker no longer *always* produces a
+vertical. If IV looks cheap on that name, you'll see a `[BULLISH/CHEAP IV]` or
+`[BEARISH/CHEAP IV]` single-leg trade instead -- tagged clearly so you know which regime
+and which reasoning produced it.
+
+**Real cost/risk tradeoff to understand**: a single-leg call or put costs more upfront
+than the equivalent vertical (since there's no short leg to offset the price), but has
+no profit cap. Your max loss is still just what you paid -- same defined-risk shape as
+buying half of a vertical -- you're only giving up the "cheaper entry, capped upside"
+trade for "costlier entry, uncapped upside." Whether that's the right tradeoff depends
+on how far you actually expect the stock to move, which is exactly what the cheap-IV
+signal is trying to flag: recent real movement has been bigger than what the option
+market is currently charging for.
+
 ---
 
 *This guide will grow over time as new concepts come up -- treat it as a living

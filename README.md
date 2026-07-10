@@ -11,11 +11,11 @@ Streamlit Cloud's shared IPs get rate-limited/blocked by Yahoo Finance.
   volume/price via Tradier's batch quotes, then pulls live option chains. Classifies
   each ticker's trend regime (bullish/bearish/neutral) and IV richness (rich/cheap/fair
   vs. realized volatility) from free data, and scans the strategy that regime calls
-  for: bull call verticals in an uptrend, bear put verticals in a downtrend,
-  butterflies when neutral with normally-priced IV, and long straddles/strangles when
-  neutral with cheap IV (betting on a real move the options market may be underpricing).
-  Ranks results by an estimated probability-weighted expected value (Black-Scholes
-  based), not just raw payout ratio, and only surfaces genuinely positive-EV setups.
+  for: bull call verticals / bear put verticals when IV is normally priced, long
+  calls / long puts / straddles / strangles when IV looks cheap relative to how much
+  the stock actually moves, butterflies when neutral with normally-priced IV. Ranks
+  results by an estimated probability-weighted expected value (Black-Scholes based),
+  not just raw payout ratio, and only surfaces genuinely positive-EV setups.
 - **Portfolio tracker**: reports live P/L on open positions using current Tradier quotes
   and option chain prices. The mobile view also shows a plain-language narrative per
   position -- days to expiration, distance from pin/breakeven, % of max profit captured,
@@ -117,7 +117,7 @@ Whenever you open/close a position with `log_trade.py` on your desktop, also upd
 the secret, not from your local file. The two can drift out of sync if you forget this
 step, so it's worth checking after every trade.
 
-## Privacy note
+## ⚠️ Privacy note
 
 `portfolio.json` is gitignored on purpose and must **never** be committed to this public
 repo -- it contains real, live trading positions (strikes, contracts, entry prices).

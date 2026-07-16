@@ -78,7 +78,7 @@ regime-aware, 5 of 6 fully backtestable. Remaining polish items live in Backlog 
 
 ## Backlog (not started)
 
-- [ ] Decide: track `backtest_log.csv` in git — **decided: yes** (see completed)
+- [x] Decide: track `backtest_log.csv` in git — decided: yes
 - [ ] Improve probability-of-profit trustworthiness. Discussed 2026-07-10: raw Black-
       Scholes probability estimates aren't necessarily well-calibrated (options IV
       tends to run a bit higher than realized volatility on average, which could bias

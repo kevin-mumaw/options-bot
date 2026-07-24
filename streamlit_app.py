@@ -14,10 +14,16 @@ import streamlit as st
 # On Streamlit Community Cloud, secrets come from st.secrets (set in the app dashboard),
 # not from a .env file. We copy it into the environment BEFORE importing options_bot,
 # so os.getenv("TRADIER_API_KEY") works the same way locally and when deployed.
-if "TRADIER_API_KEY" in st.secrets:
-    os.environ["TRADIER_API_KEY"] = st.secrets["TRADIER_API_KEY"]
-if "PORTFOLIO_JSON" in st.secrets:
-    os.environ["PORTFOLIO_JSON"] = st.secrets["PORTFOLIO_JSON"]
+# Locally there's no secrets.toml at all (options_bot.py reads .env directly instead),
+# and st.secrets raises if the file is completely missing -- not just if a key is absent
+# -- so this whole block is wrapped defensively for local runs.
+try:
+    if "TRADIER_API_KEY" in st.secrets:
+        os.environ["TRADIER_API_KEY"] = st.secrets["TRADIER_API_KEY"]
+    if "PORTFOLIO_JSON" in st.secrets:
+        os.environ["PORTFOLIO_JSON"] = st.secrets["PORTFOLIO_JSON"]
+except Exception:
+    pass  # no secrets.toml -- fine locally, .env covers it
 
 import options_bot as bot
 
@@ -63,10 +69,13 @@ with tab_portfolio:
                         st.warning(pos["error"])
                         continue
 
+                    opt_letter = "P" if pos.get("option_type") == "put" else "C"
                     if pos["type"] == "Butterfly Pin":
                         structure = f"{pos['low_strike']:.0f} / {pos['pin_strike']:.0f} / {pos['high_strike']:.0f} C"
-                    else:
-                        structure = f"BUY {pos['long_strike']:.0f}C / SELL {pos['short_strike']:.0f}C"
+                    elif pos["type"] == "Debit Vertical":
+                        structure = f"BUY {pos['long_strike']:.0f}{opt_letter} / SELL {pos['short_strike']:.0f}{opt_letter}"
+                    else:  # Long Call / Long Put -- single leg
+                        structure = f"BUY {pos['strike']:.0f}{opt_letter}"
                     total_paid = pos['entry_debit'] * 100 * pos['contracts']
                     purchase_info = (
                         f"Strikes: {structure}  |  Exp: {pos['expiration']}  |  "
@@ -79,7 +88,7 @@ with tab_portfolio:
                     col1.metric("Spot", f"${pos['spot']:.2f}")
                     col2.metric("P/L", f"${pos['pnl']:+.2f}")
                     col3.metric("Days to Exp", pos["days_to_exp"])
-                    st.caption(bot.generate_narrative(pos))
+                    st.caption(bot.generate_narrative(pos).replace("$", "\\$"))
             st.caption("General educational context only, not personalized trading advice -- always verify against your own broker and judgment before acting.")
     else:
         st.info("Tap 'Refresh Portfolio' to pull current prices, P/L, and a plain-language summary of each position.")

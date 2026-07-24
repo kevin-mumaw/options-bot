@@ -182,7 +182,49 @@ def print_calibration_report(rows):
         else:
             print(f"  --> Reasonably well calibrated (within 15 points).")
 
+    print_earnings_window_report(graded)
+
     print(f"\nTotal graded: {len(graded)}. More data = more reliable calibration -- keep running the screener and re-grading over time.")
+
+
+def print_earnings_window_report(graded):
+    """Splits CHEAP-IV setups (Long Call/Put/Straddle/Strangle -- the types gated on
+    regime['iv_regime'] == 'cheap') by whether an earnings date fell inside the 20-day
+    realized-vol lookback window used to call that IV 'cheap'. Answers directly whether
+    the earnings-gap distortion in the IV/RV ratio has actually been costing win rate,
+    instead of leaving it as a theory. Only meaningful once rows logged after the
+    earnings_in_window fix (July 2026) start getting graded -- older rows will have this
+    field blank and fall into the 'unknown' bucket."""
+    cheap_iv_types = {"Long Call", "Long Put", "Long Straddle", "Long Strangle"}
+    cheap_iv_rows = [r for r in graded if r.get("type") in cheap_iv_types]
+    if not cheap_iv_rows:
+        return
+
+    def flag(r):
+        v = (r.get("earnings_in_window") or "").strip().lower()
+        if v in ("true", "1", "yes"):
+            return "in_window"
+        if v in ("false", "0", "no"):
+            return "clean"
+        return "unknown"
+
+    print("\n" + "=" * 60)
+    print("CHEAP-IV / EARNINGS-WINDOW REPORT")
+    print("=" * 60)
+    for bucket_label, bucket_key in [
+        ("Earnings date WAS in the RV lookback window", "in_window"),
+        ("Earnings date was NOT in the RV lookback window", "clean"),
+        ("Unknown (pre-fix rows, or earnings lookup failed)", "unknown"),
+    ]:
+        subset = [r for r in cheap_iv_rows if flag(r) == bucket_key]
+        if not subset:
+            continue
+        wins = [r for r in subset if r["win"] == "yes"]
+        avg_pnl = sum(float(r["actual_pnl"]) for r in subset) / len(subset)
+        actual_win_rate = len(wins) / len(subset)
+        print(f"\n{bucket_label} (n={len(subset)}):")
+        print(f"  Actual win rate:           {actual_win_rate*100:.1f}%")
+        print(f"  Average P/L per contract:  ${avg_pnl:+.2f}")
 
 
 if __name__ == "__main__":

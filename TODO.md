@@ -76,23 +76,144 @@ regime-aware, 5 of 6 fully backtestable. Remaining polish items live in Backlog 
       early assignment risk
 - [x] GitHub profile README updated with options-bot listed under Quantitative Trading
 
+- [x] **Probability-of-profit trustworthiness improvements (2026-07-17).** NOTE: this
+      reverses the 2026-07-10 decision above to wait for backtest calibration data
+      before touching the probability model. That plan was set aside, not followed --
+      worth knowing if the earlier logic gets revisited. What actually shipped instead:
+  - [x] Earnings-gap distortion fix in `detect_regime()`'s IV/RV ratio. Root cause: a
+        single earnings-day return can dominate the 20-day realized-vol window (one
+        5-6% day contributes ~as much variance as 50 normal 0.8% days for a low-beta
+        name), making "cheap IV" post-earnings partly an artifact rather than real
+        mispricing. Fixed via winsorizing (cap outlier returns at ~3 MADs from the
+        median before computing realized vol) plus a best-effort `earnings_in_window`
+        flag (yfinance earnings-date lookup, never blocks the scan if it fails).
+        Surfaced in both the CSV log (`iv_rv_ratio`, `earnings_in_window` columns) and
+        live output (`⚠ EARNINGS IN RV WINDOW` tag). `grade_backtest.py` now has a
+        dedicated report splitting cheap-IV win rate by earnings-window status, so this
+        can eventually be checked against real outcomes instead of just theory.
+  - [x] Dividend yield adjustment. `prob_finish_above`/`bs_call_price`/`bs_put_price`
+        all previously assumed div_yield=0, which systematically overstated call
+        profitability and understated put profitability on dividend payers (PEP at
+        ~4%+ yield was the case that surfaced this). New `get_dividend_yield()`
+        (yfinance, cached, defaults to 0.0 on failure) feeds the real yield through.
+  - [x] Skew-aware breakeven pricing. Every multi-leg strategy (verticals, straddles,
+        strangles, butterflies) was blending IV across legs into one `avg_iv` for its
+        probability calc, which washes out real skew (OTM puts routinely trade richer
+        than OTM calls). Each breakeven now uses its own leg's actual IV instead.
+        Verified the mechanism moves probability in the correct direction in isolation
+        (put IV 20%->35% moved P(finish below breakeven) from 15%->29%); net effect on
+        any given trade's total probability varies by ticker since both tails can move
+        and partially offset.
+  - [x] Trade analytics on every recommendation: breakeven, max loss (always shown, capped
+        types labeled "capped", long calls/puts labeled "100% of premium"), max profit
+        (labeled "capped" for verticals/butterflies vs. "target, not a true cap" for
+        uncapped calls/puts), and an exit price to capture ~80% of that profit target
+        (BS-repriced at today's IV/DTE -- an approximation, since real theta decay
+        between now and exit usually means the actual required move is a bit smaller
+        than this implies).
+  - [x] Earnings jump-diffusion adjustment (same day, later session). Root problem:
+        plain lognormal diffusion assumes smooth price evolution the whole way to
+        expiration, but a real earnings date is a discrete jump, not smooth drift --
+        understating true tail probability when one falls inside the trade window.
+        Fixed for Long Call/Long Put specifically (the two types most directly
+        comparable, and where the actual live trades are): when expiration spans a
+        real upcoming earnings date, probability switches from plain lognormal to a
+        Monte Carlo model (`prob_finish_above_jump_aware`) -- ordinary diffusion using
+        winsorized realized vol for the quiet days, plus one bootstrapped draw from
+        the ticker's own last ~8 actual historical earnings-day returns for the jump.
+        Deliberately ignores current market IV for this calc to avoid double-counting
+        the market's own earnings pricing. Verified before shipping: a synthetic test
+        with one big historical miss in the mix correctly showed the jump-aware model
+        assigning MORE downside tail probability (25.3% vs. 17.4% for plain diffusion)
+        than the naive model. Tagged `[jump-adjusted]` in the live output whenever it
+        fires, plus a `jump_adjusted` column in the backtest log, so it's always clear
+        which probability model produced a given number. New `get_next_earnings_date`/
+        `get_historical_earnings_returns` helpers, both best-effort (yfinance), fall
+        back to the plain model on any failure. Verticals/straddles/strangles/
+        butterflies still use plain lognormal for now -- extension point if this proves
+        out.
+  - [x] Realistic bid/ask exit pricing (same session). The entry-cost side was already
+        correct (buying at ask, selling short legs at bid) -- the actual gap was in the
+        "exit price for 80% of target" calculations, which solved for the Black-Scholes
+        THEORETICAL value at some future spot price, not what you'd actually receive
+        selling to close (the bid, after crossing the spread again on the way out). New
+        `estimate_spread_haircut()` reads each leg's own currently-quoted bid/ask width
+        as a fraction of net cost, and every exit-target solve (Long Call, Long Put,
+        both Debit Verticals, Butterfly Pin) now targets a theoretical value high enough
+        to still net the real target after that haircut. Sanity-tested: a tight ~3%
+        spread (like the actual PEP put) barely moves the target ($7.05 -> $7.17);
+        wider/illiquid spreads get a proportionally bigger, more honest haircut. Assumes
+        today's quoted spread % holds at exit -- a real approximation, since spreads can
+        widen in exactly the fast moves where you're most likely to want out.
+
+**All four items from the 2026-07-10 probability-of-profit backlog entry are now done**:
+dividend yield, skew-aware IV, earnings jump-diffusion, and spread-aware exit targets.
+Next real open question is whether it's worth extending jump-diffusion and/or per-leg
+spread-awareness to the multi-leg strategy types (verticals/straddles/strangles/
+butterflies already got the skew and spread-haircut treatment; jump-diffusion is Long
+Call/Put only for now) -- revisit once there's enough graded backtest data on the two
+types that have it to see whether it's actually improving calibration in practice.
+
+- [x] Stop-loss pricing (2026-07-23). "When to exit" only had an answer for winners (the
+      80%-target exit price) -- nothing for cutting losers. New `STOP_LOSS_PCT` constant
+      (default 50%) plus a stop-loss price on Long Call, Long Put, and both Debit
+      Verticals: the stock price at which the position has lost that fraction of premium.
+      Reuses the same `exit_price_for_target` machinery as the profit target, just solved
+      against a lower value. Tested end-to-end on the PEP put case: profit target and
+      stop-loss land on opposite sides of spot, as they should. IMPORTANT KNOWN BIAS,
+      documented at the constant's definition: this price assumes today's full time-to-
+      expiration holds constant, same as the profit target -- but for a stop-loss that
+      assumption cuts the wrong way. It makes the number too OPTIMISTIC (theta decay
+      alone can produce the loss with a smaller price move than shown), not too
+      conservative. Every Stop-Loss line in the output says this explicitly. Not yet
+      validated against this bot's own backtest data -- 50% is a reasonable starting
+      point, not a proven number.
+- [x] Universe expansion (2026-07-23). Added AAL, COIN, DAL, PYPL, SQ, TSM, UAL --
+      247 -> 254 tickers, no duplicates. Real gaps closed: payments/fintech (PYPL/SQ/
+      COIN) and airlines (AAL/DAL/UAL) had zero individual-name representation despite
+      adjacent baskets (JETS) being in the universe; TSM was a notable miss given NVDA/
+      AMD/AVGO/MU were already there. Universe is still 100% large/mega-cap by design --
+      liquidity filter would kill most small caps anyway.
+- [x] Streamlit app audit (2026-07-23). Screener tab confirmed clean: it calls the exact
+      same `run_bulk_screener()` as the desktop CLI, so every fix above flows through
+      automatically, no separate display logic to maintain. Portfolio tab had a real,
+      narrower bug than initially suspected -- an incorrect first-pass claim was made
+      that Long Call/Long Put/bearish verticals weren't trackable at all, which was
+      WRONG (the backend already handled all of them correctly); the actual bug was
+      `streamlit_app.py` hardcoding every non-butterfly position's display as calls
+      regardless of whether it was actually a put spread. Fixed with an `opt_letter`
+      branch. Also fixed: `st.secrets` access crashed local runs entirely (not just
+      missing keys -- a fully absent `secrets.toml`, which is normal locally since
+      `.env` covers it), now wrapped in try/except. Also fixed: dollar signs in the
+      narrative text were getting interpreted as LaTeX math delimiters by Streamlit's
+      markdown renderer when two `$` amounts appeared close together, garbling numbers
+      into stray backticks -- same escaping the purchase-info line already had, now
+      applied to the narrative text too. Verified end-to-end: Screener tab output
+      matched the CLI exactly, Portfolio tab correctly showed all 5 live positions
+      (EWZ, KMI, NVDA, PFE, VZ -- MSFT closed same session, realized +$12.81) with
+      accurate direction-aware narratives.
+
 ## Backlog (not started)
 
-- [x] Decide: track `backtest_log.csv` in git — decided: yes
-- [ ] Improve probability-of-profit trustworthiness. Discussed 2026-07-10: raw Black-
-      Scholes probability estimates aren't necessarily well-calibrated (options IV
-      tends to run a bit higher than realized volatility on average, which could bias
-      probabilities in a predictable direction). Two candidate fixes:
-      1. Add a minimum probability-of-profit threshold so longshots stop surfacing as
-         "top picks" just because EV is technically positive -- straightforward, no
-         data dependency, but only changes *what gets shown*, not the underlying
-         accuracy of the estimate itself.
-      2. Apply a documented volatility-risk-premium correction to the raw IV before
-         estimating probabilities -- addresses the actual estimate, but is a real
-         statistical claim that ideally needs backtest validation before/after
-         applying it, or risks trading one unverified bias for another.
-      **Decided to wait for real backtest calibration data before doing either** --
-      once `grade_backtest.py` has enough graded setups (dozens per strategy type,
-      ideally more), the calibration report will show whether there's a real,
-      measurable gap between predicted and actual win rates, and by how much --
-      turning this from a guess into an evidence-based fix.
+- [ ] Decide: track `backtest_log.csv` in git — **decided: yes** (see completed)
+- [ ] Extend jump-diffusion earnings adjustment beyond Long Call/Long Put to the
+      multi-leg types (verticals, straddles, strangles, butterflies)
+- [ ] Validate `STOP_LOSS_PCT` (currently 50%, unvalidated) against real graded backtest
+      data once enough exists -- check whether cutting at 50% actually beats holding to
+      expiration for this strategy mix, and whether the "assumes no time decay" optimism
+      bias documented above is large enough in practice to matter
+- [ ] IV rank/percentile against each stock's OWN historical IV range (not just RV-
+      relative "cheap/rich" via `iv_rv_ratio`) -- the ORATS-style upgrade discussed
+      2026-07-23; current fixes made the RV-relative signal more honest but it's still
+      not the same thing as knowing where IV sits in a stock's own 1-year range
+- [ ] Position sizing / portfolio-level risk view -- every trade is currently evaluated
+      alone; no Kelly-style sizing by edge/confidence, no check for correlated bets
+      across open positions (e.g. three bearish tech plays that are really one
+      correlated bet wearing three costumes)
+- [ ] Per-strike liquidity filter -- the 254-ticker universe gets a liquidity screen,
+      but individual strikes within a chain don't; same failure mode that showed up in
+      the Tradier/Schwab IV comparison on deep OTM/ITM PEP strikes could still surface
+      a signal pointing at a strike with a terrible spread or near-zero open interest
+- [ ] Decide on a backtest-grading cadence -- `grade_backtest.py` only tells you
+      anything when it's actually run against enough graded data; nothing scheduled
+      currently

@@ -1,4 +1,4 @@
-﻿# Options Intelligence Desk
+# Options Intelligence Desk
 
 A liquid-universe options screener and portfolio P/L tracker, with a desktop CLI and a
 mobile-friendly Streamlit web view. All live market data (quotes, expirations, option
@@ -7,19 +7,23 @@ Streamlit Cloud's shared IPs get rate-limited/blocked by Yahoo Finance.
 
 ## What it does
 
-- **Screener**: scans ~250 liquid S&P 500 names + major ETFs, filters by real trading
-  volume/price via Tradier's batch quotes, then pulls live option chains. Classifies
-  each ticker's trend regime (bullish/bearish/neutral) and IV richness (rich/cheap/fair
-  vs. realized volatility) from free data, and scans the strategy that regime calls
-  for: bull call verticals / bear put verticals when IV is normally priced, long
-  calls / long puts / straddles / strangles when IV looks cheap relative to how much
-  the stock actually moves, butterflies when neutral with normally-priced IV, and
-  calendar spreads when a near-term option is pricing in meaningfully more volatility
-  than a farther-dated one. Ranks results by an estimated probability-weighted expected
-  value (Black-Scholes based), not just raw payout ratio, and only surfaces genuinely
-  positive-EV setups. **Calendar spreads are a rougher estimate than everything else
-  and can't be backtested with free data** -- see `USER_GUIDE.md` Section 12 before
-  trading one.
+- **Screener**: scans ~254 liquid S&P 500 names + major ETFs, filters by real trading
+  volume/price via Tradier's batch quotes plus a per-contract liquidity check (open
+  interest and bid/ask spread width), then pulls live option chains. Classifies each
+  ticker's trend regime (bullish/bearish/neutral) and IV richness (rich/cheap/fair vs.
+  realized volatility) from free data, and scans the strategy that regime calls for:
+  bull call verticals / bear put verticals when IV is normally priced, long calls /
+  long puts / straddles / strangles when IV looks cheap relative to how much the stock
+  actually moves, butterflies when neutral with normally-priced IV, and calendar
+  spreads when a near-term option is pricing in meaningfully more volatility than a
+  farther-dated one. Ranks results by an estimated probability-weighted expected value
+  (Black-Scholes based, with dividend yield, skew-aware per-leg IV, and -- for Long
+  Call/Long Put -- an earnings jump-diffusion adjustment when expiration spans a real
+  earnings date), not just raw payout ratio, and only surfaces genuinely positive-EV
+  setups. Every recommendation shows breakeven, max profit/loss, a spread-aware exit
+  price to capture ~80% of the profit target, and a stop-loss price. **Calendar spreads
+  are a rougher estimate than everything else and can't be backtested with free data**
+  -- see `USER_GUIDE.md` Section 12 before trading one.
 - **Portfolio tracker**: reports live P/L on open positions using current Tradier quotes
   and option chain prices. The mobile view also shows a plain-language narrative per
   position -- days to expiration, distance from pin/breakeven, % of max profit captured,
@@ -36,6 +40,8 @@ Streamlit Cloud's shared IPs get rate-limited/blocked by Yahoo Finance.
 | `log_trade.py` | Add/close positions in `portfolio.json` |
 | `diagnose_scan.py` | Debug tool -- traces one ticker step by step through the pipeline |
 | `grade_backtest.py` | Grades expired setups against real outcomes, reports calibration |
+| `migrate_backtest_log.py` | One-time migration for `backtest_log.csv` schema changes |
+| `Pre_Trade_Checklist.md` | Manual pre-trade checklist to run through before entering a position |
 | `backtest_log.csv` | Every candidate setup the screener has ever found (auto-generated, safe to commit -- no real trades, just hypothetical candidates) |
 
 Note: `portfolio.json` is **not** in this repo (gitignored) -- see Privacy note below.
@@ -58,13 +64,18 @@ This pulls the underlying's actual closing price near that expiration date (free
 yfinance) and computes the *exact* payoff analytically -- no historical options data
 needed, since a vertical/butterfly's payoff at expiration is fully determined by where
 the stock closed. It prints a calibration report: does the model's "70% probability of
-profit" actually win about 70% of the time, or is it over/under-confident?
+profit" actually win about 70% of the time, or is it over/under-confident? It also
+breaks out cheap-IV setups by whether their expiration spanned an earnings date, so the
+earnings-gap-distortion fix in the IV/RV ratio can be checked against real outcomes
+over time, not just theory.
 
 Run the screener regularly and re-run `grade_backtest.py` periodically (e.g. weekly) --
 the more setups that accumulate and expire, the more reliable the calibration report
 becomes. Early on, with only a handful of graded setups, don't over-interpret the
 numbers; wait for a meaningful sample size (dozens, ideally hundreds) before trusting
-the calibration gap as a signal to change the model.
+the calibration gap as a signal to change the model. In particular, the current
+`STOP_LOSS_PCT` (50%) is a reasonable starting default, not yet validated against this
+bot's own graded outcomes -- worth revisiting once there's enough data.
 
 **Calendar spreads are excluded from this.** Their outcome depends on a historical
 option price this tool doesn't have free access to, not just the stock's closing
@@ -94,7 +105,10 @@ forward-test shows promise and you want to validate faster / further back.
    TRADIER_API_KEY=your_key_here
    ```
 3. Create `portfolio.json` locally (not committed) with your open positions -- see
-   `log_trade.py` to add them interactively instead of hand-writing JSON.
+   `log_trade.py` to add them interactively instead of hand-writing JSON. Supported
+   sections: `butterfly_spreads`, `bullish_debit_spreads`, `bearish_debit_spreads`,
+   `long_calls`, `long_puts`, and `closed_trades` (your own record of closed positions
+   -- not read by the bot itself, purely for your reference).
 4. Run the CLI: `python options_bot.py`
    Or the web view locally: `streamlit run streamlit_app.py`
 5. **If you have an existing `backtest_log.csv` from before regime-based strategy
@@ -117,7 +131,7 @@ committed. Instead, positions live in Streamlit's private Secrets.
 5. In the app's **Settings -> Secrets**, add:
    ```
    TRADIER_API_KEY = "your_key_here"
-   PORTFOLIO_JSON = '{"butterfly_spreads": [...], "bullish_debit_spreads": [...], "straight_positions": []}'
+   PORTFOLIO_JSON = '{"butterfly_spreads": [...], "bullish_debit_spreads": [...], "bearish_debit_spreads": [...], "long_calls": [...], "long_puts": [...]}'
    ```
    (paste your real portfolio.json contents as a single-line JSON string for the second one)
 6. Open the deployed URL from your phone.
@@ -127,7 +141,7 @@ Whenever you open/close a position with `log_trade.py` on your desktop, also upd
 the secret, not from your local file. The two can drift out of sync if you forget this
 step, so it's worth checking after every trade.
 
-## ⚠️ Privacy note
+## Privacy note
 
 `portfolio.json` is gitignored on purpose and must **never** be committed to this public
 repo -- it contains real, live trading positions (strikes, contracts, entry prices).
@@ -138,10 +152,22 @@ first.
 
 ## Known limitations
 
-- EV estimates use a simplified Black-Scholes model (0% risk-free rate, no dividends,
-  binary payoff approximation) -- useful for ranking setups against each other, not a
-  precise fair-value calculation.
-- The liquidity pre-filter (`MIN_AVG_VOLUME`, `MIN_PRICE` in `options_bot.py`) is a
-  volume/price proxy, not a direct spread-width check.
-- `UNIVERSE` is a static list that will drift from actual S&P 500 / Nasdaq 100
-  membership over time and needs periodic manual refreshing.
+- EV estimates use a simplified Black-Scholes model -- 0% risk-free rate, and probability
+  is still a lognormal-diffusion approximation for every strategy type except Long
+  Call/Long Put with an upcoming earnings date (those get a Monte Carlo jump-diffusion
+  adjustment instead, using the ticker's own historical earnings-day moves). Dividend
+  yield and per-leg skew-aware IV are now factored in. Useful for ranking setups against
+  each other and giving a realistic entry/exit/stop plan, not a precise fair-value
+  calculation.
+- The per-contract liquidity filter checks both open interest (>= 500) and bid/ask
+  spread width (<= 15% of mid), applied once to the whole chain before any strike is
+  eligible for any strategy. It does not check trading volume separately from OI.
+- Exit-price and stop-loss targets assume today's full time-to-expiration holds
+  constant ("if this move happened right now"). For profit targets this makes the
+  number too conservative (a real target is usually easier to reach as time decay
+  helps close the gap); for stop-losses it's the opposite and more important to know --
+  the displayed price can be too optimistic, since theta decay alone can produce the
+  loss threshold with a smaller adverse move than shown. Large-move exit targets get an
+  explicit on-screen warning; stop-loss lines always carry this caveat.
+- `UNIVERSE` is a static list (currently 254 tickers) that will drift from actual S&P
+  500 / Nasdaq 100 membership over time and needs periodic manual refreshing.

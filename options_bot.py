@@ -11,6 +11,7 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)  # ETFs have no earning
 # scan. This isn't an error condition (handled fine by the try/except in the earnings
 # helpers below), just noisy console output for something totally expected.
 import time
+import threading
 import csv
 import base64
 import io
@@ -29,6 +30,20 @@ TRADIER_BASE_URL = "https://api.tradier.com/v1"
 # names too, since those are dominated by the same mega-caps) + the standard heavily-traded
 # ETF universe. This is the RAW candidate pool -- filter_liquid_universe() below cuts it
 # down to genuinely tradable names by real volume/price before any options data is pulled.
+_regime_counts_lock = threading.Lock()
+_regime_counts = {}  # (trend, iv_regime) -> count. Diagnostic only -- lets run_bulk_screener
+# report how many tickers actually landed in each regime bucket, so "zero credit spreads
+# found today" can be told apart from "the regime that would trigger them never
+# occurred" vs. "it occurred but the strike/delta/credit filters rejected everything."
+# Reset at the start of every run_bulk_screener() call; read at the end.
+
+
+def _record_regime(trend, iv_regime):
+    with _regime_counts_lock:
+        key = f"{trend}/{iv_regime}"
+        _regime_counts[key] = _regime_counts.get(key, 0) + 1
+
+
 STOP_LOSS_PCT = 0.50  # Cut a losing long-premium position once it's lost this fraction
 # of what you paid, rather than riding it toward a full loss. Long options/debit spreads
 # can never lose more than the premium -- this isn't about avoiding catastrophic loss,
@@ -49,6 +64,51 @@ STOP_LOSS_PCT = 0.50  # Cut a losing long-premium position once it's lost this f
 # the trade's life. Treat the displayed stop price as a rough outer bound, not a precise
 # trigger -- and don't wait for price alone to hit it if the position's actual current
 # value has already crossed the loss threshold.
+
+CREDIT_SPREAD_TARGET_DELTA = 0.225  # midpoint of the .20-.25 delta band from the
+# Algo-Aware Strategy Framework -- places the short strike far enough out that
+# short-term algorithmic noise rarely threatens the breakeven, without giving up so
+# much premium that the trade isn't worth taking.
+CREDIT_SPREAD_TAKE_PROFIT_PCT = 0.50  # close/take profit once 50% of max credit is captured
+CREDIT_SPREAD_STOP_LOSS_MULTIPLE = 2.0  # close if unrealized loss reaches 2x the credit
+# received (i.e. cost to close = 3x net credit) -- standard retail credit-spread risk
+# rule. Unlike STOP_LOSS_PCT (debit side, expressed as % of premium PAID), credit
+# spreads have no "premium paid" to lose a percentage of -- the natural unit here is
+# multiples of premium COLLECTED, since max loss (width - credit) can be much larger
+# than the credit itself.
+
+
+def select_strike_by_delta(df, target_delta=CREDIT_SPREAD_TARGET_DELTA):
+    """Given atm_calls or atm_puts, returns the row whose |delta| is closest to
+    target_delta, as a dict. Falls back to None if no rows have delta data at all --
+    Tradier's greeks feed can be intermittently unavailable, especially for
+    illiquid/newly-listed contracts, and callers must handle that gracefully rather
+    than assume delta is always present just because it was requested."""
+    if df.empty or 'delta' not in df.columns:
+        return None
+    valid = df[df['delta'].notna()].copy()
+    if valid.empty:
+        return None
+    valid['delta_dist'] = (valid['delta'].abs() - target_delta).abs()
+    return valid.loc[valid['delta_dist'].idxmin()].to_dict()
+
+
+def next_strike_further_otm(df, short_strike, side):
+    """Finds the next available strike further out-of-the-money than short_strike, for
+    selecting the protective long leg of a credit spread. side='put' means further OTM
+    = lower strike; side='call' means further OTM = higher strike. Returns the CLOSEST
+    such strike (tightest available wing), not an arbitrary fixed width -- matches how
+    the existing butterfly wing_width is derived from actually-listed strikes rather
+    than a hardcoded dollar amount. Returns None if there's no further strike available
+    (short strike is already at the edge of the chain)."""
+    if side == 'put':
+        candidates = df[df['strike'] < short_strike].sort_values('strike', ascending=False)
+    else:
+        candidates = df[df['strike'] > short_strike].sort_values('strike', ascending=True)
+    if candidates.empty:
+        return None
+    return candidates.iloc[0].to_dict()
+
 
 UNIVERSE = [
     "AAL", "AAPL", "ABBV", "ABNB", "ABT", "ACN", "ADBE", "ADI", "ADP",
@@ -91,7 +151,7 @@ BACKTEST_LOG_FILE = "backtest_log.csv"
 BACKTEST_LOG_COLUMNS = [
     "run_date", "ticker", "type", "option_type", "direction", "expiration", "near_expiration", "spot_at_scan",
     "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
-    "strike", "call_strike", "put_strike",
+    "strike", "call_strike", "put_strike", "call_long_strike", "put_long_strike",
     "net_cost", "max_profit", "prob_profit", "ev", "iv_rv_ratio", "earnings_in_window", "jump_adjusted",
     "graded", "actual_spot_at_exp", "actual_payoff", "actual_pnl", "win"
 ]
@@ -870,6 +930,49 @@ def get_portfolio_status():
         except Exception as e:
             positions.append({"ticker": tk, "type": "Long Put", "error": str(e)})
 
+    for cal in portfolio.get("calendar_spreads", []):
+        tk = cal.get("ticker", "?")
+        try:
+            quote = get_tradier_quote(tk, headers)
+            if not quote:
+                positions.append({"ticker": tk, "type": "Calendar Spread", "error": "no quote returned"})
+                continue
+            spot = quote.get('last') or 0
+            opt_type = cal.get("option_type", "call")
+            near_chain = [o for o in get_tradier_chain(tk, cal["near_expiration"], headers) if o.get('option_type') == opt_type]
+            far_chain = [o for o in get_tradier_chain(tk, cal["far_expiration"], headers) if o.get('option_type') == opt_type]
+            near_rows = [o for o in near_chain if o.get('strike') == cal['strike']]
+            far_rows = [o for o in far_chain if o.get('strike') == cal['strike']]
+            if not (near_rows and far_rows):
+                positions.append({"ticker": tk, "type": "Calendar Spread", "error": f"couldn't find strike {cal['strike']} in one or both expirations ({cal['near_expiration']} / {cal['far_expiration']})"})
+                continue
+            # Sold the near leg, bought the far leg -- position value = far leg's value
+            # minus near leg's value, same sign convention as entry_debit (what you paid
+            # to establish: far_ask - near_bid at entry, mid-priced here for ongoing
+            # valuation same as every other position type).
+            p_near = ((near_rows[0].get('bid') or 0) + (near_rows[0].get('ask') or 0)) / 2
+            p_far = ((far_rows[0].get('bid') or 0) + (far_rows[0].get('ask') or 0)) / 2
+            current_value = p_far - p_near
+            pnl = (current_value - cal["entry_debit"]) * 100 * cal["contracts"]
+            # Days to the NEAR expiration, not the far one -- that's the actual decision
+            # point for a calendar spread. Once the near leg expires, the position's
+            # entire character changes (you're left holding just the far leg outright).
+            days_to_exp = (datetime.strptime(cal["near_expiration"], "%Y-%m-%d") - datetime.now()).days
+            positions.append({
+                "ticker": tk, "type": "Calendar Spread", "option_type": opt_type, "direction": "neutral",
+                "spot": spot, "expiration": cal["near_expiration"], "days_to_exp": days_to_exp,
+                "entry_debit": cal["entry_debit"], "current_value": current_value, "pnl": pnl,
+                "contracts": cal["contracts"], "strike": cal["strike"],
+                "far_expiration": cal["far_expiration"],
+                # No clean breakeven/max_profit_total here -- unlike verticals/butterflies,
+                # a calendar's payoff depends on BOTH time and vol, not just where the
+                # stock closed. Same "rough estimate, can't be backtested with free data"
+                # honesty already applied to this strategy type in the scanner.
+                "max_profit_total": None, "profit_captured_pct": None,
+            })
+        except Exception as e:
+            positions.append({"ticker": tk, "type": "Calendar Spread", "error": str(e)})
+
     return {"positions": positions}
 
 def generate_narrative(pos):
@@ -928,10 +1031,18 @@ def generate_narrative(pos):
             else:
                 lines.append("Stock is still below breakeven -- needs to move up for this to be profitable by expiration.")
 
+    elif pos["type"] == "Calendar Spread":
+        lines.append(f"Strike: ${pos['strike']:.2f} -- short leg expires {pos['expiration']}, long leg expires {pos['far_expiration']}.")
+        lines.append("No clean breakeven or max-profit figure for this one -- unlike a vertical or butterfly, a calendar's value depends on BOTH where the stock is AND how much time/volatility remains on the far leg, not just price alone.")
+        if abs(pos["spot"] - pos["strike"]) / pos["strike"] < 0.02:
+            lines.append("Stock is sitting close to the strike -- generally the sweet spot for a calendar, since that's where the near leg decays fastest relative to the far leg.")
+
     if pnl > 0 and pct is not None:
         lines.append(f"Currently up ${pnl:+.2f}, roughly {pct:.0f}% of max theoretical profit captured.")
         if pct >= 50:
             lines.append("Many options traders take profits in the 50-75% range on debit spreads rather than holding for full max, since time decay cuts both ways as expiration nears.")
+    elif pnl > 0:
+        lines.append(f"Currently up ${pnl:+.2f}.")
     elif pnl < 0:
         lines.append(f"Currently down ${pnl:+.2f}. Worth revisiting whether the original thesis for this trade still holds given the time remaining.")
 
@@ -978,7 +1089,8 @@ def scan_single_ticker(ticker):
             row = {
                 'strike': opt.get('strike'), 'expiration': target_date,
                 'bid': opt.get('bid') or 0, 'ask': opt.get('ask') or 0,
-                'openInterest': opt.get('open_interest') or 0, 'impliedVolatility': iv
+                'openInterest': opt.get('open_interest') or 0, 'impliedVolatility': iv,
+                'delta': greeks.get('delta')  # None if unavailable -- callers must check for this
             }
             if opt.get('option_type') == 'call':
                 calls_list.append(row)
@@ -1006,6 +1118,7 @@ def scan_single_ticker(ticker):
         regime = detect_regime(ticker, current_iv=avg_iv_for_regime)
         if regime is None: return setups
         trend = regime["trend"]
+        _record_regime(trend, regime["iv_regime"])
         div_yield = get_dividend_yield(ticker)
 
         if trend == "bullish" and regime["iv_regime"] == "cheap" and not atm_calls.empty:
@@ -1055,6 +1168,44 @@ def scan_single_ticker(ticker):
                     "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
                     "desc": f"[BULLISH/CHEAP IV] BUY ${strike} C (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (NOTE: calls have theoretically unlimited upside -- this is a realistic target, not a hard cap) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero -- NOTE: assumes no further time decay, so a {STOP_LOSS_PCT*100:.0f}% loss may actually arrive SOONER/with a smaller move than this, as theta erodes value passively while you wait) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}"
                 })
+
+        elif trend == "bullish" and regime["iv_regime"] == "rich" and not atm_puts.empty:
+            # Rich IV + bullish/neutral-bullish -- sell premium instead of buying it.
+            # Short strike targeted at ~.20-.25 delta per the Algo-Aware Strategy
+            # Framework: far enough OTM that short-term algorithmic noise rarely
+            # threatens the breakeven, without giving up excessive credit.
+            short_leg = select_strike_by_delta(atm_puts)
+            if short_leg is not None:
+                long_leg = next_strike_further_otm(atm_puts, short_leg['strike'], 'put')
+                if long_leg is not None:
+                    width = short_leg['strike'] - long_leg['strike']
+                    net_credit = short_leg['bid'] - long_leg['ask']
+                    max_loss = width - net_credit
+                    if net_credit > 0.15 and width > 0 and net_credit >= width / 3.0 and max_loss > 0:
+                        breakeven = short_leg['strike'] - net_credit
+                        # Skew-aware: breakeven sits near the SHORT strike (the one
+                        # actually driving risk here), use its own IV.
+                        prob_profit = prob_finish_above(spot, breakeven, short_leg['impliedVolatility'], days_to_exp, div_yield)
+                        ev = prob_profit * net_credit - (1 - prob_profit) * max_loss
+
+                        def _bull_put_close_cost(S, _short=short_leg['strike'], _long=long_leg['strike'], _iv=short_leg['impliedVolatility'], _dte=days_to_exp, _dy=div_yield):
+                            return bs_put_price(S, _short, _iv, _dte, _dy) - bs_put_price(S, _long, _iv, _dte, _dy)
+
+                        spread_haircut = estimate_spread_haircut(net_credit, short_leg, long_leg)
+                        take_profit_target = net_credit * (1 - CREDIT_SPREAD_TAKE_PROFIT_PCT)
+                        take_profit_target_adj = take_profit_target * (1 + spread_haircut / 2)
+                        take_profit_price = exit_price_for_target("down", _bull_put_close_cost, spot, take_profit_target_adj)
+                        stop_target = net_credit * (1 + CREDIT_SPREAD_STOP_LOSS_MULTIPLE)
+                        stop_price = exit_price_for_target("down", _bull_put_close_cost, spot, stop_target)
+
+                        setups.append({
+                            "ticker": ticker, "type": "Credit Put Spread", "option_type": "put", "direction": "bullish",
+                            "score": net_credit / max_loss if max_loss > 0 else 0, "prob_profit": prob_profit, "ev": ev,
+                            "expiration": target_date, "spot_at_scan": spot,
+                            "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
+                            "net_cost": net_credit, "max_profit": net_credit,
+                            "desc": f"[BULLISH/RICH IV] SELL ${short_leg['strike']} P / BUY ${long_leg['strike']} P (Credit: ${net_credit:.2f}) | Breakeven: ${breakeven:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays >= ${short_leg['strike']:.2f} at exp) | Max Loss: ${max_loss:.2f} (capped) | Take-Profit: buy back near ${take_profit_price:.2f}{exit_price_caveat(take_profit_price, spot)} to lock in ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of max credit | Stop-Loss: buy back near ${stop_price:.2f} if stock drops that far (cuts loss at {CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received -- NOTE: assumes no further time decay, real trigger may arrive sooner) | Short Delta: {abs(short_leg.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                        })
 
         elif trend == "bullish" and len(atm_calls) >= 2:
             for idx in range(len(atm_calls) - 1):
@@ -1143,6 +1294,38 @@ def scan_single_ticker(ticker):
                     "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
                     "desc": f"[BEARISH/CHEAP IV] BUY ${strike} P (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Max Theoretical Profit: ${true_max_profit:.2f} (only if stock->$0 -- unrealistic) | Realistic Target Profit @ ~1SD move: ${assumed_payoff:.2f} | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero -- NOTE: assumes no further time decay, so a {STOP_LOSS_PCT*100:.0f}% loss may actually arrive SOONER/with a smaller move than this, as theta erodes value passively while you wait) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}"
                 })
+
+        elif trend == "bearish" and regime["iv_regime"] == "rich" and not atm_calls.empty:
+            short_leg = select_strike_by_delta(atm_calls)
+            if short_leg is not None:
+                long_leg = next_strike_further_otm(atm_calls, short_leg['strike'], 'call')
+                if long_leg is not None:
+                    width = long_leg['strike'] - short_leg['strike']
+                    net_credit = short_leg['bid'] - long_leg['ask']
+                    max_loss = width - net_credit
+                    if net_credit > 0.15 and width > 0 and net_credit >= width / 3.0 and max_loss > 0:
+                        breakeven = short_leg['strike'] + net_credit
+                        prob_profit = 1 - prob_finish_above(spot, breakeven, short_leg['impliedVolatility'], days_to_exp, div_yield)
+                        ev = prob_profit * net_credit - (1 - prob_profit) * max_loss
+
+                        def _bear_call_close_cost(S, _short=short_leg['strike'], _long=long_leg['strike'], _iv=short_leg['impliedVolatility'], _dte=days_to_exp, _dy=div_yield):
+                            return bs_call_price(S, _short, _iv, _dte, _dy) - bs_call_price(S, _long, _iv, _dte, _dy)
+
+                        spread_haircut = estimate_spread_haircut(net_credit, short_leg, long_leg)
+                        take_profit_target = net_credit * (1 - CREDIT_SPREAD_TAKE_PROFIT_PCT)
+                        take_profit_target_adj = take_profit_target * (1 + spread_haircut / 2)
+                        take_profit_price = exit_price_for_target("up", _bear_call_close_cost, spot, take_profit_target_adj)
+                        stop_target = net_credit * (1 + CREDIT_SPREAD_STOP_LOSS_MULTIPLE)
+                        stop_price = exit_price_for_target("up", _bear_call_close_cost, spot, stop_target)
+
+                        setups.append({
+                            "ticker": ticker, "type": "Credit Call Spread", "option_type": "call", "direction": "bearish",
+                            "score": net_credit / max_loss if max_loss > 0 else 0, "prob_profit": prob_profit, "ev": ev,
+                            "expiration": target_date, "spot_at_scan": spot,
+                            "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
+                            "net_cost": net_credit, "max_profit": net_credit,
+                            "desc": f"[BEARISH/RICH IV] SELL ${short_leg['strike']} C / BUY ${long_leg['strike']} C (Credit: ${net_credit:.2f}) | Breakeven: ${breakeven:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays <= ${short_leg['strike']:.2f} at exp) | Max Loss: ${max_loss:.2f} (capped) | Take-Profit: buy back near ${take_profit_price:.2f}{exit_price_caveat(take_profit_price, spot)} to lock in ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of max credit | Stop-Loss: buy back near ${stop_price:.2f} if stock rises that far (cuts loss at {CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received -- NOTE: assumes no further time decay, real trigger may arrive sooner) | Short Delta: {abs(short_leg.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                        })
 
         elif trend == "bearish" and len(atm_puts) >= 2:
             for idx in range(len(atm_puts) - 1):
@@ -1256,6 +1439,36 @@ def scan_single_ticker(ticker):
                         "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
                         "desc": f"[NEUTRAL/CHEAP IV] BUY ${call_leg['strike']} C + BUY ${put_leg['strike']} P (Cost: ${net_cost:.2f}) | Breakevens: ${breakeven_down:.2f} / ${breakeven_up:.2f} | Max Loss: ${net_cost:.2f} (capped, if stock finishes between the two strikes) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (uncapped upside, no clean 80%-exit price since both legs move together) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}"
                     })
+
+        elif trend == "neutral" and regime["iv_regime"] == "rich" and not atm_calls.empty and not atm_puts.empty:
+            put_short = select_strike_by_delta(atm_puts)
+            call_short = select_strike_by_delta(atm_calls)
+            if put_short is not None and call_short is not None:
+                put_long = next_strike_further_otm(atm_puts, put_short['strike'], 'put')
+                call_long = next_strike_further_otm(atm_calls, call_short['strike'], 'call')
+                if put_long is not None and call_long is not None:
+                    put_width = put_short['strike'] - put_long['strike']
+                    call_width = call_long['strike'] - call_short['strike']
+                    net_credit = (put_short['bid'] - put_long['ask']) + (call_short['bid'] - call_long['ask'])
+                    max_loss = max(put_width, call_width) - net_credit
+                    if net_credit > 0.15 and put_width > 0 and call_width > 0 and max_loss > 0:
+                        breakeven_low = put_short['strike'] - net_credit
+                        breakeven_high = call_short['strike'] + net_credit
+                        # Same skew-aware pattern as strangles: each breakeven priced
+                        # with its own side's short-leg IV, not a blend.
+                        prob_profit = (prob_finish_above(spot, breakeven_low, put_short['impliedVolatility'], days_to_exp, div_yield)
+                                       - prob_finish_above(spot, breakeven_high, call_short['impliedVolatility'], days_to_exp, div_yield))
+                        ev = prob_profit * net_credit - (1 - prob_profit) * max_loss
+
+                        setups.append({
+                            "ticker": ticker, "type": "Iron Condor", "option_type": "both", "direction": "neutral",
+                            "score": net_credit / max_loss if max_loss > 0 else 0, "prob_profit": prob_profit, "ev": ev,
+                            "expiration": target_date, "spot_at_scan": spot,
+                            "put_strike": put_short['strike'], "put_long_strike": put_long['strike'],
+                            "call_strike": call_short['strike'], "call_long_strike": call_long['strike'],
+                            "net_cost": net_credit, "max_profit": net_credit,
+                            "desc": f"[NEUTRAL/RICH IV] SELL ${put_short['strike']} P / BUY ${put_long['strike']} P + SELL ${call_short['strike']} C / BUY ${call_long['strike']} C (Credit: ${net_credit:.2f}) | Breakevens: ${breakeven_low:.2f} / ${breakeven_high:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays between the short strikes at exp) | Max Loss: ${max_loss:.2f} (capped, worse-case wing) | Take-Profit target: buy back once cost to close drops to ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of credit received -- no single clean exit PRICE since both wings move independently, watch position value directly instead | Stop-Loss: cut if cost to close reaches ~{CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received | Put Delta: {abs(put_short.get('delta') or 0):.2f} / Call Delta: {abs(call_short.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}"
+                        })
 
         elif trend == "neutral" and len(atm_calls) >= 3:
             for idx in range(len(atm_calls) - 2):
@@ -1393,18 +1606,29 @@ def format_setup_list(setups, header):
         section += f"{i}. [{setup['ticker'].upper()}] (Ratio: {setup['score']:.1f}:1, Est. EV: ${setup['ev']:+.2f})\n   {setup['desc']}\n\n"
     return section
 
-def run_bulk_screener(progress=print):
+def run_bulk_screener(progress=print, return_setups=False):
     all_setups = []
+    with _regime_counts_lock:
+        _regime_counts.clear()
     progress(f" [*] Universe: {len(UNIVERSE)} candidate tickers. Checking liquidity (price/volume)...")
     liquid_tickers = filter_liquid_universe(UNIVERSE, progress=progress)
     progress(f" [*] {len(liquid_tickers)} tickers passed the liquidity filter (avg volume >= {MIN_AVG_VOLUME:,}, price >= ${MIN_PRICE:.0f}).")
     if not liquid_tickers:
-        return "No tickers passed the liquidity filter -- check your Tradier connection or thresholds."
+        msg = "No tickers passed the liquidity filter -- check your Tradier connection or thresholds."
+        return (msg, {}) if return_setups else msg
     progress(f" [*] Scanning {len(liquid_tickers)} liquid tickers for options setups via parallel multithreading pools...")
     with ThreadPoolExecutor(max_workers=15) as executor:
         results = executor.map(scan_single_ticker, liquid_tickers)
     for res_list in results:
         if res_list: all_setups.extend(res_list)
+
+    with _regime_counts_lock:
+        if _regime_counts:
+            breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(_regime_counts.items(), key=lambda x: -x[1]))
+            progress(f" [*] Regime breakdown (trend/IV) across scanned tickers -- {breakdown}")
+            rich_count = sum(v for k, v in _regime_counts.items() if k.endswith("/rich"))
+            if rich_count == 0:
+                progress(" [*] NOTE: zero tickers landed in a 'rich' IV regime this run -- that's why Credit Put/Call Spreads and Iron Condors found nothing to evaluate. Not a filter being too strict, the triggering condition itself didn't occur today.")
 
     if all_setups:
         log_setups(all_setups)
@@ -1417,6 +1641,9 @@ def run_bulk_screener(progress=print):
     long_calls = [s for s in all_setups if s['type'] == 'Long Call' and s['ev'] > 0]
     long_puts = [s for s in all_setups if s['type'] == 'Long Put' and s['ev'] > 0]
     calendars = [s for s in all_setups if s['type'] == 'Calendar Spread' and s['ev'] > 0]
+    credit_puts = [s for s in all_setups if s['type'] == 'Credit Put Spread' and s['ev'] > 0]
+    credit_calls = [s for s in all_setups if s['type'] == 'Credit Call Spread' and s['ev'] > 0]
+    iron_condors = [s for s in all_setups if s['type'] == 'Iron Condor' and s['ev'] > 0]
 
     top_verticals = sorted(dedupe_best_per_ticker(verticals), key=lambda x: x['ev'], reverse=True)[:3]
     top_butterflies = sorted(dedupe_best_per_ticker(butterflies), key=lambda x: x['ev'], reverse=True)[:3]
@@ -1425,11 +1652,34 @@ def run_bulk_screener(progress=print):
     top_long_calls = sorted(dedupe_best_per_ticker(long_calls), key=lambda x: x['ev'], reverse=True)[:3]
     top_long_puts = sorted(dedupe_best_per_ticker(long_puts), key=lambda x: x['ev'], reverse=True)[:3]
     top_calendars = sorted(dedupe_best_per_ticker(calendars), key=lambda x: x['ev'], reverse=True)[:3]
+    top_credit_puts = sorted(dedupe_best_per_ticker(credit_puts), key=lambda x: x['ev'], reverse=True)[:3]
+    top_credit_calls = sorted(dedupe_best_per_ticker(credit_calls), key=lambda x: x['ev'], reverse=True)[:3]
+    top_iron_condors = sorted(dedupe_best_per_ticker(iron_condors), key=lambda x: x['ev'], reverse=True)[:3]
 
-    if not any([top_verticals, top_butterflies, top_straddles, top_strangles, top_long_calls, top_long_puts, top_calendars]):
-        return "No positive-expected-value setups identified across the universe today. That's a legitimate result, not an error -- it means nothing in today's liquid universe cleared the bar once probability of profit is factored in."
+    grouped = {
+        "Credit Put Spreads": top_credit_puts, "Credit Call Spreads": top_credit_calls,
+        "Iron Condors": top_iron_condors,
+        "Debit Verticals": top_verticals, "Butterfly Pins": top_butterflies,
+        "Long Straddles": top_straddles, "Long Strangles": top_strangles,
+        "Long Calls": top_long_calls, "Long Puts": top_long_puts,
+        "Calendar Spreads": top_calendars,
+    }
 
-    summary = format_setup_list(top_verticals, "=== TOP DEBIT VERTICALS (1 per ticker, positive EV only) ===")
+    if not any([top_verticals, top_butterflies, top_straddles, top_strangles, top_long_calls, top_long_puts,
+                top_calendars, top_credit_puts, top_credit_calls, top_iron_condors]):
+        msg = "No positive-expected-value setups identified across the universe today. That's a legitimate result, not an error -- it means nothing in today's liquid universe cleared the bar once probability of profit is factored in."
+        return (msg, {}) if return_setups else msg
+
+    summary = format_setup_list(top_credit_puts, "=== TOP CREDIT PUT SPREADS (1 per ticker, positive EV only) ===")
+    if not top_credit_puts:
+        summary += "=== TOP CREDIT PUT SPREADS ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_credit_calls, "=== TOP CREDIT CALL SPREADS (1 per ticker, positive EV only) ===")
+    if not top_credit_calls:
+        summary += "=== TOP CREDIT CALL SPREADS ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_iron_condors, "=== TOP IRON CONDORS (1 per ticker, positive EV only) ===")
+    if not top_iron_condors:
+        summary += "=== TOP IRON CONDORS ===\nNone found with positive estimated EV today.\n\n"
+    summary += format_setup_list(top_verticals, "=== TOP DEBIT VERTICALS (1 per ticker, positive EV only) ===")
     if not top_verticals:
         summary += "=== TOP DEBIT VERTICALS ===\nNone found with positive estimated EV today.\n\n"
     summary += format_setup_list(top_butterflies, "=== TOP BUTTERFLY PINS (1 per ticker, positive EV only) ===")
@@ -1450,7 +1700,7 @@ def run_bulk_screener(progress=print):
     summary += format_setup_list(top_calendars, "=== TOP CALENDAR SPREADS (1 per ticker, positive EV only -- UNGRADABLE ESTIMATE, see USER_GUIDE.md) ===")
     if not top_calendars:
         summary += "=== TOP CALENDAR SPREADS ===\nNone found with positive estimated EV today.\n\n"
-    return summary
+    return (summary, grouped) if return_setups else summary
 
 if __name__ == "__main__":
     print("\n╔" + "═"*44 + "╗")

@@ -31,6 +31,20 @@ st.set_page_config(page_title="Options Intelligence Desk", page_icon="📊", lay
 
 st.title("📊 Options Intelligence Desk")
 
+# st.code() renders in a <pre> block that doesn't wrap long lines by default -- with
+# this bot's long, detail-packed trade descriptions (breakeven, stop-loss, exit target,
+# etc. all on one line), that meant endless horizontal scrolling on a phone just to read
+# one trade. This CSS forces wrapping on Streamlit's code blocks specifically.
+st.markdown("""
+<style>
+div[data-testid="stCodeBlock"] pre {
+    white-space: pre-wrap !important;
+    word-wrap: break-word !important;
+    overflow-x: hidden !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 tab_screener, tab_portfolio = st.tabs(["🔍 Screener", "💼 Portfolio"])
 
 with tab_screener:
@@ -44,11 +58,34 @@ with tab_screener:
             status_box.info("\n\n".join(log_lines))
 
         with st.spinner("Scanning universe..."):
-            result_text = bot.run_bulk_screener(progress=show_progress)
+            result_text, grouped = bot.run_bulk_screener(progress=show_progress, return_setups=True)
 
         status_box.empty()
+        with st.expander("Scan log (tap to see ticker/liquidity counts)"):
+            st.write("\n\n".join(log_lines))
         st.markdown("#### Results")
-        st.code(result_text, language=None)
+
+        if not grouped:
+            st.info(result_text)
+        else:
+            any_shown = False
+            for category, setups in grouped.items():
+                if not setups:
+                    continue
+                any_shown = True
+                st.markdown(f"**{category}**")
+                for s in setups:
+                    with st.container(border=True):
+                        st.markdown(f"**{s['ticker']}**  (Est. EV: ${s['ev']:+.2f}, Prob. of Profit: {s['prob_profit']*100:.0f}%)")
+                        # desc is a single pipe-delimited line built for the CLI --
+                        # splitting it here gives the same info without the wall-of-text
+                        # that required horizontal scrolling to read on a phone.
+                        fields = [f.strip() for f in s['desc'].split('|')]
+                        for field in fields:
+                            st.caption(field.replace("$", "\\$"))
+            if not any_shown:
+                st.info("No positive-expected-value setups identified across the universe today. That's a legitimate result, not an error -- it means nothing in today's liquid universe cleared the bar once probability of profit is factored in.")
+
         st.caption("EV estimates use a simplified Black-Scholes probability model. Not a guarantee -- verify in your broker before trading.")
 
 with tab_portfolio:

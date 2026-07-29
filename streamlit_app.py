@@ -32,9 +32,10 @@ st.set_page_config(page_title="Options Intelligence Desk", page_icon="📊", lay
 st.title("📊 Options Intelligence Desk")
 
 # st.code() renders in a <pre> block that doesn't wrap long lines by default -- with
-# this bot's long, detail-packed trade descriptions (breakeven, stop-loss, exit target,
-# etc. all on one line), that meant endless horizontal scrolling on a phone just to read
-# one trade. This CSS forces wrapping on Streamlit's code blocks specifically.
+# this bot's long, detail-packed trade descriptions, that meant endless horizontal
+# scrolling on a phone just to read one trade. This CSS forces wrapping. (Left in place
+# even though the main results now render as cards below, in case st.code is ever used
+# elsewhere.)
 st.markdown("""
 <style>
 div[data-testid="stCodeBlock"] pre {
@@ -61,7 +62,7 @@ with tab_screener:
             result_text, grouped = bot.run_bulk_screener(progress=show_progress, return_setups=True)
 
         status_box.empty()
-        with st.expander("Scan log (tap to see ticker/liquidity counts)"):
+        with st.expander("Scan log (tap to see ticker/liquidity/regime counts)"):
             st.write("\n\n".join(log_lines))
         st.markdown("#### Results")
 
@@ -111,6 +112,8 @@ with tab_portfolio:
                         structure = f"{pos['low_strike']:.0f} / {pos['pin_strike']:.0f} / {pos['high_strike']:.0f} C"
                     elif pos["type"] == "Debit Vertical":
                         structure = f"BUY {pos['long_strike']:.0f}{opt_letter} / SELL {pos['short_strike']:.0f}{opt_letter}"
+                    elif pos["type"] == "Calendar Spread":
+                        structure = f"SELL {pos['strike']:.0f}{opt_letter} {pos['expiration']} / BUY {pos['strike']:.0f}{opt_letter} {pos['far_expiration']}"
                     else:  # Long Call / Long Put -- single leg
                         structure = f"BUY {pos['strike']:.0f}{opt_letter}"
                     total_paid = pos['entry_debit'] * 100 * pos['contracts']

@@ -28,8 +28,8 @@ BACKUP_FILE = "backtest_log_backup.csv"
 CURRENT_COLUMNS = [
     "run_date", "ticker", "type", "option_type", "direction", "expiration", "near_expiration", "spot_at_scan",
     "long_strike", "short_strike", "low_strike", "mid_strike", "high_strike",
-    "strike", "call_strike", "put_strike",
-    "net_cost", "max_profit", "prob_profit", "ev",
+    "strike", "call_strike", "put_strike", "call_long_strike", "put_long_strike",
+    "net_cost", "max_profit", "prob_profit", "ev", "iv_rv_ratio", "earnings_in_window", "jump_adjusted",
     "graded", "actual_spot_at_exp", "actual_payoff", "actual_pnl", "win"
 ]
 

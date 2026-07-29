@@ -193,6 +193,47 @@ types that have it to see whether it's actually improving calibration in practic
       (EWZ, KMI, NVDA, PFE, VZ -- MSFT closed same session, realized +$12.81) with
       accurate direction-aware narratives.
 
+## Session Log -- 2026-07-28/29
+
+**Discovered tonight**: a git merge conflict from a prior session silently reverted large
+chunks of work across `options_bot.py`, `streamlit_app.py`, `grade_backtest.py`, and
+`migrate_backtest_log.py` -- despite commit messages claiming otherwise. Confirmed missing:
+the entire credit-spread/iron-condor feature, Streamlit's card-based results display
+(`return_setups`), calendar spread portfolio tracking, and the regime diagnostic counter.
+**Lesson for future sessions**: after any merge, verify with `findstr` that recently-built
+features actually survived -- don't trust a commit message or `git status` alone.
+
+- [x] Rebuilt everything above from scratch (all previously tested logic, re-applied
+      identically): delta parsing on chain rows, credit-spread constants and
+      delta-selection helpers, all three credit-spread strategy branches, `iron_condor`
+      grading math in `grade_backtest.py`, calendar spread live tracking in
+      `get_portfolio_status()`/`generate_narrative()`/`streamlit_app.py`, the
+      `return_setups`-based readable card display, and the regime diagnostic counter.
+      All four files verified syntax-valid and full-module-compile-clean before handoff.
+- [x] **RSI structural divergence detector** (genuinely new tonight) -- `compute_rsi()`
+      (Wilder's smoothing, standard convention) plus `detect_rsi_divergence()`, checking
+      both bullish (price lower-low + RSI higher-low) and bearish (mirror image) cases
+      on the daily chart, requiring swing points >=15 trading days apart per the
+      Algo-Aware Strategy Framework's "hard to fake multi-week divergence" reasoning.
+      Tested against both a genuine synthetic divergence case (correctly detected) and a
+      plain-continuing-downtrend negative case (correctly returned None) before wiring
+      into `detect_regime()` and tagging onto every setup's desc string.
+- [x] **`log_trade.py` fully extended** -- previously only supported Butterfly, a single
+      generic Debit Spread, and a deprecated "straight_positions" category with no
+      calendar/credit-spread/iron-condor/long-call/long-put support at all. Now covers
+      all 9 position types, including proper Long Call/Long Put (replacing the deprecated
+      category), with input validation on every field and automatic backup-before-write.
+      Credit Put/Call Spreads and Iron Condors can be logged for record-keeping but
+      **don't have live P/L tracking in `get_portfolio_status()` yet** -- flagged
+      honestly in both the tool's own output and here, not silently pretended to work.
+- [x] Fixed multiple real `portfolio.json` syntax errors found live tonight: space-vs-
+      underscore key typos (`"calendar spreads"`, `"near expiration"`), a genuinely
+      malformed entry (`"option type"` with no colon or value), a missing comma between
+      closed-trade entries, and a literal unfilled `"YYYY-MM-DD"` placeholder for VZ's
+      close date.
+- [x] Closed VZ (bullish debit spread, KMI-style): entry $0.28, exit $0.71, +$43.00
+      realized.
+
 ## Backlog (not started)
 
 - [ ] Decide: track `backtest_log.csv` in git — **decided: yes** (see completed)
@@ -207,9 +248,10 @@ types that have it to see whether it's actually improving calibration in practic
       2026-07-23; current fixes made the RV-relative signal more honest but it's still
       not the same thing as knowing where IV sits in a stock's own 1-year range
 - [ ] Position sizing / portfolio-level risk view -- every trade is currently evaluated
-      alone; no Kelly-style sizing by edge/confidence, no check for correlated bets
-      across open positions (e.g. three bearish tech plays that are really one
-      correlated bet wearing three costumes)
+      alone (screener defaults to 1 contract regardless of account size); no Kelly-style
+      sizing by edge/confidence, no check for correlated bets across open positions
+      (e.g. three bearish tech plays that are really one correlated bet wearing three
+      costumes), no display of % of buying power a suggested trade would consume
 - [ ] Per-strike liquidity filter -- the 254-ticker universe gets a liquidity screen,
       but individual strikes within a chain don't; same failure mode that showed up in
       the Tradier/Schwab IV comparison on deep OTM/ITM PEP strikes could still surface
@@ -217,9 +259,21 @@ types that have it to see whether it's actually improving calibration in practic
 - [ ] Decide on a backtest-grading cadence -- `grade_backtest.py` only tells you
       anything when it's actually run against enough graded data; nothing scheduled
       currently
-## Backlog
-
-- [ ] Add position-sizing to screener output — currently defaults to 1 contract regardless of account size.
-      Scale contract count to a target % of buying power or fixed $ allocation per trade,
-      instead of hardcoded 1. Surface the % of account/buying power a suggested trade would
-      consume before entry.
+- [ ] Live P/L tracking for Credit Put/Call Spreads and Iron Condors in
+      `get_portfolio_status()` -- can be logged via `log_trade.py` now, but shows no
+      live P/L until this is built
+- [ ] Stop-loss closing-price confirmation (from Algo-Aware Strategy Framework) --
+      protects against liquidity-hunt wicks triggering a bad exit; `daily_risk_check.py`
+      partially addresses this (checks once daily, after close, rather than continuously)
+      but the underlying stop_price itself still assumes no time decay
+- [ ] Mid-price shown as a suggested starting limit order on every recommendation
+- [ ] Bot-suggested roll targets for losing positions
+- [ ] Close-confirmation/multi-bar-hold rule for MA breakout signals (RSI divergence is
+      done; this companion piece from the same framework section is not)
+- [ ] Watchlist segmentation by algorithmic personality (momentum vs. macro-cyclical
+      routing to debit-only vs. credit-eligible strategies)
+- [ ] VWAP/Volume Profile -- blocked on confirming Tradier's intraday time & sales
+      endpoint against a live call first
+- [ ] SQLite migration for `portfolio.json` (recommended over JSON for ACID/crash
+      protection; `backtest_log.csv` intentionally stays CSV due to the mobile
+      GitHub-API sync mechanism)

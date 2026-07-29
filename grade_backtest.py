@@ -36,6 +36,24 @@ def put_vertical_payoff(spot_at_exp, long_strike, short_strike):
     return long_value - short_value
 
 
+def credit_put_spread_value_owed(spot_at_exp, short_strike, long_strike):
+    """Amount OWED at expiration on a bull put credit spread (short the HIGHER put for
+    credit, long the LOWER put for protection), per share."""
+    return max(0.0, short_strike - spot_at_exp) - max(0.0, long_strike - spot_at_exp)
+
+
+def credit_call_spread_value_owed(spot_at_exp, short_strike, long_strike):
+    """Amount OWED at expiration on a bear call credit spread (short the LOWER call for
+    credit, long the HIGHER call for protection), per share."""
+    return max(0.0, spot_at_exp - short_strike) - max(0.0, spot_at_exp - long_strike)
+
+
+def iron_condor_value_owed(spot_at_exp, put_short_strike, put_long_strike, call_short_strike, call_long_strike):
+    """Sum of both sides' value-owed -- only one side can ever be ITM at once."""
+    return (credit_put_spread_value_owed(spot_at_exp, put_short_strike, put_long_strike)
+            + credit_call_spread_value_owed(spot_at_exp, call_short_strike, call_long_strike))
+
+
 def butterfly_payoff(spot_at_exp, low_strike, mid_strike, high_strike):
     """Payoff of a long call butterfly at expiration (per share), built from the exact
     sum of the three individual call legs (long low, short 2x mid, long high) -- this is
@@ -122,10 +140,25 @@ def grade_log(log_file=LOG_FILE):
             payoff = long_call_payoff(spot_at_exp, float(row["strike"]))
         elif row["type"] == "Long Put":
             payoff = long_put_payoff(spot_at_exp, float(row["strike"]))
+        elif row["type"] == "Credit Put Spread":
+            value_owed = credit_put_spread_value_owed(spot_at_exp, float(row["short_strike"]), float(row["long_strike"]))
+            payoff = net_cost - value_owed
+        elif row["type"] == "Credit Call Spread":
+            value_owed = credit_call_spread_value_owed(spot_at_exp, float(row["short_strike"]), float(row["long_strike"]))
+            payoff = net_cost - value_owed
+        elif row["type"] == "Iron Condor":
+            value_owed = iron_condor_value_owed(
+                spot_at_exp, float(row["put_strike"]), float(row["put_long_strike"]),
+                float(row["call_strike"]), float(row["call_long_strike"])
+            )
+            payoff = net_cost - value_owed
         else:
             continue
 
-        pnl = (payoff - net_cost) * 100  # per 1 contract
+        if row["type"] in ("Credit Put Spread", "Credit Call Spread", "Iron Condor"):
+            pnl = payoff * 100
+        else:
+            pnl = (payoff - net_cost) * 100  # per 1 contract
         row["actual_spot_at_exp"] = f"{spot_at_exp:.2f}"
         row["actual_payoff"] = f"{payoff:.2f}"
         row["actual_pnl"] = f"{pnl:.2f}"

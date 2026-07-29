@@ -217,3 +217,9 @@ types that have it to see whether it's actually improving calibration in practic
 - [ ] Decide on a backtest-grading cadence -- `grade_backtest.py` only tells you
       anything when it's actually run against enough graded data; nothing scheduled
       currently
+## Backlog
+
+- [ ] Add position-sizing to screener output — currently defaults to 1 contract regardless of account size.
+      Scale contract count to a target % of buying power or fixed $ allocation per trade,
+      instead of hardcoded 1. Surface the % of account/buying power a suggested trade would
+      consume before entry.

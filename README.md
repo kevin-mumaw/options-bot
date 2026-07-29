@@ -1,4 +1,4 @@
-﻿# Options Intelligence Desk
+# Options Intelligence Desk
 
 A liquid-universe options screener and portfolio P/L tracker, with a desktop CLI and a
 mobile-friendly Streamlit web view. All live market data (quotes, expirations, option
@@ -141,7 +141,7 @@ Whenever you open/close a position with `log_trade.py` on your desktop, also upd
 the secret, not from your local file. The two can drift out of sync if you forget this
 step, so it's worth checking after every trade.
 
-## ⚠️ Privacy note
+## Privacy note
 
 `portfolio.json` is gitignored on purpose and must **never** be committed to this public
 repo -- it contains real, live trading positions (strikes, contracts, entry prices).
@@ -170,4 +170,5 @@ first.
   loss threshold with a smaller adverse move than shown. Large-move exit targets get an
   explicit on-screen warning; stop-loss lines always carry this caveat.
 - `UNIVERSE` is a static list (currently 254 tickers) that will drift from actual S&P
-  500 / Nasdaq 100 membership over time and needs periodic manual refreshing.
+
+500 / Nasdaq 100 membership over time and needs periodic manual refreshing.

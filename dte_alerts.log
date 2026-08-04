@@ -1,0 +1,9 @@
+
+--- DTE check run: 2026-07-28 19:12:35 ---
+[ERROR] Could not check portfolio: Configuration file 'portfolio.json' not found or is empty.
+
+--- Daily risk check run: 2026-07-28 22:47:01 ---
+All 6 open position(s) are outside the 21-DTE boundary and above their stop-loss threshold. No action needed today.
+
+[NOTE] No stop-loss rule is defined yet for: Butterfly Pin.
+        These position(s) are tracked for DTE but NOT checked against any stop-loss threshold.

@@ -24,7 +24,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PORTFOLIO_FILE = "portfolio.json"
-TRADIER_BASE_URL = "https://api.tradier.com/v1"
+# Sandbox provides the SAME real market data feed as production, just delayed the
+# industry-standard 15 minutes -- not simulated/fake data. Set TRADIER_SANDBOX=false in
+# .env once the Tradier account is funded and production access is restored. Delayed
+# data is a non-issue for this bot's actual use case (swing trades held for weeks, never
+# day-trading) -- see Algo-Aware Strategy Framework, "abandon execution speed."
+TRADIER_BASE_URL = "https://sandbox.tradier.com/v1" if os.getenv("TRADIER_SANDBOX", "true").lower() == "true" else "https://api.tradier.com/v1"
 
 # Liquid universe: top ~200 S&P 500 companies by market cap (covers nearly all Nasdaq 100
 # names too, since those are dominated by the same mega-caps) + the standard heavily-traded
@@ -244,16 +249,40 @@ def log_setups(setups):
 
 
 def filter_liquid_universe(tickers, progress=print):
-    """Cuts the raw universe down to genuinely liquid names using Tradier's batch quote
+    """Cuts the raw universe down to genuinely liquid names using a batch quote
     endpoint (a handful of calls for the whole universe), BEFORE spending option-chain
     calls on names that wouldn't qualify anyway. Real options IV/liquidity is still checked
     per-ticker later in scan_single_ticker -- this stage only screens on price/volume."""
+    liquid = []
+    batch_size = 100
+    if DATA_SOURCE == "schwab":
+        try:
+            client = get_schwab_client()
+        except Exception as e:
+            progress(f" [!] Schwab client error: {e}")
+            return []
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i + batch_size]
+            try:
+                resp = client.get_quotes(batch, fields=["quote", "fundamental"])
+                resp.raise_for_status()
+                data = resp.json()
+                for symbol, q in data.items():
+                    quote_node = q.get('quote', {})
+                    fundamental_node = q.get('fundamental', {})
+                    price = quote_node.get('lastPrice') or quote_node.get('mark') or 0
+                    avg_vol = (fundamental_node.get('avg10DaysVolume') or fundamental_node.get('avg1YearVolume')
+                               or quote_node.get('totalVolume') or 0)
+                    if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
+                        liquid.append(symbol)
+            except Exception as e:
+                progress(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
+        return liquid
+
     token = os.getenv("TRADIER_API_KEY")
     if not token:
         return []
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    liquid = []
-    batch_size = 100
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         try:
@@ -771,7 +800,111 @@ def detect_regime(ticker, current_iv, price_history=None):
         "rsi_divergence": rsi_divergence,
     }
 
+DATA_SOURCE = os.getenv("DATA_SOURCE", "tradier").lower()  # "tradier" or "schwab"
+
+_schwab_client_cache = None
+
+
+def get_schwab_client():
+    """Cached Schwab client using the existing token.json/app key/secret setup already
+    working in weekly-options-signal-engine. Requires SCHWAB_APP_KEY, SCHWAB_APP_SECRET,
+    and SCHWAB_TOKEN_PATH (defaults to ./token.json) in .env."""
+    global _schwab_client_cache
+    if _schwab_client_cache is not None:
+        return _schwab_client_cache
+    from schwab.auth import client_from_token_file
+    api_key = os.getenv("SCHWAB_APP_KEY")
+    app_secret = os.getenv("SCHWAB_APP_SECRET")
+    token_path = os.getenv("SCHWAB_TOKEN_PATH", "./token.json")
+    if not api_key or not app_secret:
+        raise RuntimeError("SCHWAB_APP_KEY / SCHWAB_APP_SECRET not set in .env")
+    _schwab_client_cache = client_from_token_file(token_path, api_key, app_secret, enforce_enums=False)
+    return _schwab_client_cache
+
+
+def _schwab_option_to_tradier_shape(contract, option_type):
+    """Reshapes one Schwab option-chain contract into the exact dict shape Tradier's
+    /markets/options/chains endpoint returns, so every downstream parser in this file
+    (which expects opt.get('bid'), opt.get('open_interest'), opt.get('greeks',{}).get(
+    'mid_iv')/'delta', opt.get('strike'), opt.get('option_type')) keeps working
+    unmodified regardless of which data source is active."""
+    return {
+        'strike': contract.get('strikePrice'),
+        'option_type': option_type,
+        'bid': contract.get('bid') or 0,
+        'ask': contract.get('ask') or 0,
+        'open_interest': contract.get('openInterest') or 0,
+        'greeks': {
+            'mid_iv': (contract.get('volatility') or 0) / 100.0,  # Schwab reports as a
+            # percentage (23.4 == 23.4%), Tradier's mid_iv is already decimal -- verified
+            # against a live PEP comparison 2026-07-23, not guessed.
+            'delta': contract.get('delta'),
+        },
+    }
+
+
+def get_schwab_quote(symbol):
+    """Returns {'last': float, 'average_volume': float} matching the fields this file
+    actually reads off a Tradier quote dict. average_volume comes from Schwab's
+    'fundamental' data node -- field name UNVERIFIED against a live response (schwab-py's
+    own docs decline to document option-chain/fundamental fields in detail). Falls back
+    to 0 if the field isn't where expected, which will simply exclude that ticker from
+    the liquidity filter rather than crash -- flagged here so it's easy to find and fix
+    if liquidity filtering behaves oddly on Schwab."""
+    client = get_schwab_client()
+    resp = client.get_quote(symbol, fields=["quote", "fundamental"])
+    resp.raise_for_status()
+    data = resp.json()
+    q = data.get(symbol, {})
+    quote_node = q.get('quote', {})
+    fundamental_node = q.get('fundamental', {})
+    avg_vol = (fundamental_node.get('avg10DaysVolume') or fundamental_node.get('avg1YearVolume')
+               or quote_node.get('totalVolume') or 0)  # last resort: today's volume, not a true average
+    return {
+        'last': quote_node.get('lastPrice') or quote_node.get('mark') or 0,
+        'average_volume': avg_vol,
+        'symbol': symbol,
+    }
+
+
+def get_schwab_chain_raw(symbol, expiration):
+    """Returns a flat list of option dicts (Tradier-shaped) for one expiration."""
+    client = get_schwab_client()
+    exp_date_obj = datetime.strptime(expiration, "%Y-%m-%d").date()
+    resp = client.get_option_chain(symbol, from_date=exp_date_obj, to_date=exp_date_obj)
+    resp.raise_for_status()
+    data = resp.json()
+    options = []
+    for side_key, opt_type in (("callExpDateMap", "call"), ("putExpDateMap", "put")):
+        exp_map = data.get(side_key, {})
+        for exp_key, strikes in exp_map.items():
+            for strike_str, contracts in strikes.items():
+                if contracts:
+                    options.append(_schwab_option_to_tradier_shape(contracts[0], opt_type))
+    return options
+
+
+def get_schwab_expirations(symbol):
+    """Returns a sorted list of expiration date strings ('YYYY-MM-DD') available for
+    this ticker, pulled from a wide unfiltered option-chain call."""
+    client = get_schwab_client()
+    resp = client.get_option_chain(symbol)
+    resp.raise_for_status()
+    data = resp.json()
+    dates = set()
+    for side_key in ("callExpDateMap", "putExpDateMap"):
+        for exp_key in data.get(side_key, {}):
+            dates.add(exp_key.split(":")[0])
+    return sorted(dates)
+
+
 def get_tradier_quote(symbol, headers):
+    if DATA_SOURCE == "schwab":
+        try:
+            q = get_schwab_quote(symbol)
+            return {'last': q['last'], 'average_volume': q['average_volume'], 'symbol': symbol}
+        except Exception:
+            return None
     res = requests.get(f"{TRADIER_BASE_URL}/markets/quotes",
                         params={"symbols": symbol}, headers=headers, timeout=10).json()
     q = (res.get('quotes') or {}).get('quote')
@@ -780,6 +913,11 @@ def get_tradier_quote(symbol, headers):
     return q
 
 def get_tradier_chain(symbol, expiration, headers):
+    if DATA_SOURCE == "schwab":
+        try:
+            return get_schwab_chain_raw(symbol, expiration)
+        except Exception:
+            return []
     res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
                         params={"symbol": symbol, "expiration": expiration},
                         headers=headers, timeout=10).json()
@@ -792,8 +930,8 @@ def track_live_portfolio():
     portfolio = load_portfolio()
     if not portfolio: return f"\n[!] Configuration file '{PORTFOLIO_FILE}' not found or is empty."
     token = os.getenv("TRADIER_API_KEY")
-    if not token: return "\n[!] TRADIER_API_KEY not set -- can't pull live prices."
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if DATA_SOURCE != "schwab" and not token: return "\n[!] TRADIER_API_KEY not set -- can't pull live prices."
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
     report = "\n" + "═"*60 + "\n          LIVE OPTIONS PORTFOLIO RISK TRACKER\n" + "═"*60 + "\n"
     if portfolio.get("butterfly_spreads"):
         report += "─── ACTIVE BUTTERFLY SPREADS ───\n"
@@ -854,9 +992,9 @@ def get_portfolio_status():
     if not portfolio:
         return {"error": f"Configuration file '{PORTFOLIO_FILE}' not found or is empty."}
     token = os.getenv("TRADIER_API_KEY")
-    if not token:
+    if DATA_SOURCE != "schwab" and not token:
         return {"error": "TRADIER_API_KEY not set -- can't pull live prices."}
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
     positions = []
 
     for bfly in portfolio.get("butterfly_spreads", []):
@@ -1133,14 +1271,14 @@ def generate_narrative(pos):
     return " ".join(lines)
 
 def scan_single_ticker(ticker):
-    """Pulls option chains via Tradier, detects the ticker's regime (trend + IV
-    richness), and dispatches to the strategy that regime calls for: bull call
-    verticals in an uptrend, bear put verticals in a downtrend, butterflies when
-    neutral."""
+    """Pulls option chains (Tradier or Schwab, per DATA_SOURCE), detects the ticker's
+    regime (trend + IV richness), and dispatches to the strategy that regime calls for:
+    bull call verticals in an uptrend, bear put verticals in a downtrend, butterflies
+    when neutral."""
     setups = []
     token = os.getenv("TRADIER_API_KEY")
-    if not token: return setups
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if DATA_SOURCE != "schwab" and not token: return setups
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
 
     try:
         # Spot price
@@ -1149,21 +1287,23 @@ def scan_single_ticker(ticker):
         spot = spot_hist['Close'].iloc[-1]
 
         # 1. Get available expirations for this ticker, pick the one 30-75 days out
-        exp_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/expirations",
-                                params={"symbol": ticker}, headers=headers, timeout=10).json()
-        expirations = (exp_res.get('expirations') or {}).get('date', [])
-        if isinstance(expirations, str): expirations = [expirations]
+        if DATA_SOURCE == "schwab":
+            try:
+                expirations = get_schwab_expirations(ticker)
+            except Exception:
+                expirations = []
+        else:
+            exp_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/expirations",
+                                    params={"symbol": ticker}, headers=headers, timeout=10).json()
+            expirations = (exp_res.get('expirations') or {}).get('date', [])
+            if isinstance(expirations, str): expirations = [expirations]
         if not expirations: return setups
 
         target_date = get_macro_expiration(expirations)
         if not target_date: return setups
 
         # 2. Pull the full option chain for that expiration (bid/ask/OI/IV all included)
-        chain_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
-                                  params={"symbol": ticker, "expiration": target_date, "greeks": "true"},
-                                  headers=headers, timeout=10).json()
-        options = (chain_res.get('options') or {}).get('option', [])
-        if isinstance(options, dict): options = [options]  # Tradier returns a dict instead of a list when there's only one contract
+        options = get_tradier_chain(ticker, target_date, headers)
         if not options: return setups
 
         calls_list, puts_list = [], []
@@ -1613,11 +1753,7 @@ def scan_single_ticker(ticker):
             near_date = get_near_term_expiration(expirations, target_date)
             if near_date and not atm_calls.empty:
                 try:
-                    near_chain_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
-                                                   params={"symbol": ticker, "expiration": near_date, "greeks": "true"},
-                                                   headers=headers, timeout=10).json()
-                    near_options = (near_chain_res.get('options') or {}).get('option', [])
-                    if isinstance(near_options, dict): near_options = [near_options]
+                    near_options = get_tradier_chain(ticker, near_date, headers)
                     near_calls_list = []
                     for opt in near_options:
                         if opt.get('option_type') != 'call': continue

@@ -464,8 +464,16 @@ def exit_price_caveat(exit_price, spot, threshold=0.12):
         return ""
     move_pct = abs(exit_price - spot) / spot
     if move_pct >= threshold:
-        return f" [NOTE: implies a {move_pct*100:.0f}% move assuming NO time decay between now and then -- actual required move is likely smaller as expiration approaches]"
+        return f" [NOTE: {move_pct*100:.0f}% move assumes flat time value -- real move needed is likely smaller as expiration nears]"
     return ""
+
+
+def stop_loss_caveat():
+    """Same flat-time-value simplification as exit_price_caveat, applied to the stop
+    side: the stop trigger will likely arrive at a SMALLER/sooner move than stated,
+    since theta keeps eroding value the whole time the position is open, not just at
+    the moment of the hypothetical move."""
+    return " [NOTE: assumes flat time value -- real trigger likely arrives sooner/smaller]"
 
 
 def exit_price_for_target(direction, valuation_fn, spot, target_value, search_mult=(0.3, 3.0)):
@@ -1399,7 +1407,7 @@ def scan_single_ticker(ticker):
                     "expiration": target_date, "spot_at_scan": spot, "strike": strike,
                     "net_cost": cost, "max_profit": assumed_payoff, "jump_adjusted": jump_adjusted,
                     "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
-                    "desc": f"[BULLISH/CHEAP IV] BUY ${strike} C (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (NOTE: calls have theoretically unlimited upside -- this is a realistic target, not a hard cap) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero -- NOTE: assumes no further time decay, so a {STOP_LOSS_PCT*100:.0f}% loss may actually arrive SOONER/with a smaller move than this, as theta erodes value passively while you wait) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
+                    "desc": f"[BULLISH/CHEAP IV] BUY ${strike} C (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (NOTE: calls have theoretically unlimited upside -- this is a realistic target, not a hard cap) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
                 })
 
         elif trend == "bullish" and regime["iv_regime"] == "rich" and not atm_puts.empty:
@@ -1431,7 +1439,7 @@ def scan_single_ticker(ticker):
                             "expiration": target_date, "spot_at_scan": spot,
                             "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
                             "net_cost": net_credit, "max_profit": net_credit,
-                            "desc": f"[BULLISH/RICH IV] SELL ${short_leg['strike']} P / BUY ${long_leg['strike']} P (Credit: ${net_credit:.2f}) | Breakeven: ${breakeven:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays >= ${short_leg['strike']:.2f} at exp) | Max Loss: ${max_loss:.2f} (capped) | Take-Profit: buy back near ${take_profit_price:.2f}{exit_price_caveat(take_profit_price, spot)} to lock in ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of max credit | Stop-Loss: buy back near ${stop_price:.2f} if stock drops that far (cuts loss at {CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received -- NOTE: assumes no further time decay, real trigger may arrive sooner) | Short Delta: {abs(short_leg.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
+                            "desc": f"[BULLISH/RICH IV] SELL ${short_leg['strike']} P / BUY ${long_leg['strike']} P (Credit: ${net_credit:.2f}) | Breakeven: ${breakeven:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays >= ${short_leg['strike']:.2f} at exp) | Max Loss: ${max_loss:.2f} (capped) | Take-Profit: buy back near ${take_profit_price:.2f}{exit_price_caveat(take_profit_price, spot)} to lock in ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of max credit | Stop-Loss: buy back near ${stop_price:.2f} if stock drops that far (cuts loss at {CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received){stop_loss_caveat()} | Short Delta: {abs(short_leg.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
                         })
 
         elif trend == "bullish" and len(atm_calls) >= 2:
@@ -1473,7 +1481,7 @@ def scan_single_ticker(ticker):
                         "expiration": target_date, "spot_at_scan": spot,
                         "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
                         "net_cost": net_debit, "max_profit": max_profit,
-                        "desc": f"[BULLISH] BUY ${long_leg['strike']} C / SELL ${short_leg['strike']} C (Cost: ${net_debit:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${net_debit:.2f} (capped) | Max Gain: ${max_profit:.2f} (capped, hit if stock >= ${short_leg['strike']:.2f} at exp) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of max gain | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero -- NOTE: assumes no further time decay, so a {STOP_LOSS_PCT*100:.0f}% loss may actually arrive SOONER/with a smaller move than this, as theta erodes value passively while you wait) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
+                        "desc": f"[BULLISH] BUY ${long_leg['strike']} C / SELL ${short_leg['strike']} C (Cost: ${net_debit:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${net_debit:.2f} (capped) | Max Gain: ${max_profit:.2f} (capped, hit if stock >= ${short_leg['strike']:.2f} at exp) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of max gain | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
                     })
 
         elif trend == "bearish" and regime["iv_regime"] == "cheap" and not atm_puts.empty:
@@ -1519,7 +1527,7 @@ def scan_single_ticker(ticker):
                     "expiration": target_date, "spot_at_scan": spot, "strike": strike,
                     "net_cost": cost, "max_profit": assumed_payoff, "jump_adjusted": jump_adjusted,
                     "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
-                    "desc": f"[BEARISH/CHEAP IV] BUY ${strike} P (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Max Theoretical Profit: ${true_max_profit:.2f} (only if stock->$0 -- unrealistic) | Realistic Target Profit @ ~1SD move: ${assumed_payoff:.2f} | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero -- NOTE: assumes no further time decay, so a {STOP_LOSS_PCT*100:.0f}% loss may actually arrive SOONER/with a smaller move than this, as theta erodes value passively while you wait) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
+                    "desc": f"[BEARISH/CHEAP IV] BUY ${strike} P (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Max Theoretical Profit: ${true_max_profit:.2f} (only if stock->$0 -- unrealistic) | Realistic Target Profit @ ~1SD move: ${assumed_payoff:.2f} | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
                 })
 
         elif trend == "bearish" and regime["iv_regime"] == "rich" and not atm_calls.empty:
@@ -1551,7 +1559,7 @@ def scan_single_ticker(ticker):
                             "expiration": target_date, "spot_at_scan": spot,
                             "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
                             "net_cost": net_credit, "max_profit": net_credit,
-                            "desc": f"[BEARISH/RICH IV] SELL ${short_leg['strike']} C / BUY ${long_leg['strike']} C (Credit: ${net_credit:.2f}) | Breakeven: ${breakeven:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays <= ${short_leg['strike']:.2f} at exp) | Max Loss: ${max_loss:.2f} (capped) | Take-Profit: buy back near ${take_profit_price:.2f}{exit_price_caveat(take_profit_price, spot)} to lock in ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of max credit | Stop-Loss: buy back near ${stop_price:.2f} if stock rises that far (cuts loss at {CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received -- NOTE: assumes no further time decay, real trigger may arrive sooner) | Short Delta: {abs(short_leg.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
+                            "desc": f"[BEARISH/RICH IV] SELL ${short_leg['strike']} C / BUY ${long_leg['strike']} C (Credit: ${net_credit:.2f}) | Breakeven: ${breakeven:.2f} | Max Profit: ${net_credit:.2f} (capped, kept if stock stays <= ${short_leg['strike']:.2f} at exp) | Max Loss: ${max_loss:.2f} (capped) | Take-Profit: buy back near ${take_profit_price:.2f}{exit_price_caveat(take_profit_price, spot)} to lock in ~{CREDIT_SPREAD_TAKE_PROFIT_PCT*100:.0f}% of max credit | Stop-Loss: buy back near ${stop_price:.2f} if stock rises that far (cuts loss at {CREDIT_SPREAD_STOP_LOSS_MULTIPLE:.0f}x credit received){stop_loss_caveat()} | Short Delta: {abs(short_leg.get('delta') or 0):.2f} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
                         })
 
         elif trend == "bearish" and len(atm_puts) >= 2:
@@ -1593,7 +1601,7 @@ def scan_single_ticker(ticker):
                         "expiration": target_date, "spot_at_scan": spot,
                         "long_strike": long_leg['strike'], "short_strike": short_leg['strike'],
                         "net_cost": net_debit, "max_profit": max_profit,
-                        "desc": f"[BEARISH] BUY ${long_leg['strike']} P / SELL ${short_leg['strike']} P (Cost: ${net_debit:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${net_debit:.2f} (capped) | Max Gain: ${max_profit:.2f} (capped, hit if stock <= ${short_leg['strike']:.2f} at exp) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of max gain | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero -- NOTE: assumes no further time decay, so a {STOP_LOSS_PCT*100:.0f}% loss may actually arrive SOONER/with a smaller move than this, as theta erodes value passively while you wait) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
+                        "desc": f"[BEARISH] BUY ${long_leg['strike']} P / SELL ${short_leg['strike']} P (Cost: ${net_debit:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${net_debit:.2f} (capped) | Max Gain: ${max_profit:.2f} (capped, hit if stock <= ${short_leg['strike']:.2f} at exp) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of max gain | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{divergence_tag}"
                     })
 
         elif trend == "neutral" and regime["iv_regime"] == "cheap" and not atm_calls.empty and not atm_puts.empty:

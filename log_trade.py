@@ -238,6 +238,36 @@ def compute_realized_pnl(category, position, exit_price):
     return (exit_price - entry_cost) * 100 * contracts
 
 
+def remove_position_no_close(portfolio):
+    """For correcting a mistaken entry (duplicate, wrong ticker, never actually a real
+    position) -- removes it entirely with NO closed_trades record, unlike close_position
+    which always logs a realized P/L. Use close_position instead for any position that
+    was actually a real, live trade you're exiting."""
+    print("\n--- Remove a Position (correction only -- NOT a real close, no P/L logged) ---")
+    list_positions(portfolio)
+    categories = [c for c in ALL_OPEN_CATEGORIES if portfolio.get(c)]
+    if not categories:
+        return
+    print("\nWhich category?")
+    for i, c in enumerate(categories):
+        print(f"  {i}: {c}")
+    cat_idx = prompt_int("Category number")
+    if cat_idx < 0 or cat_idx >= len(categories):
+        print("  Invalid category.")
+        return
+    category = categories[cat_idx]
+    items = portfolio[category]
+    for i, item in enumerate(items):
+        print(f"  [{i}] {json.dumps(item)}")
+    pos_idx = prompt_int("Position number to remove")
+    if pos_idx < 0 or pos_idx >= len(items):
+        print("  Invalid position number.")
+        return
+    removed = items.pop(pos_idx)
+    print(f"\n[OK] Removed {removed.get('ticker', '?')} from {category}. No P/L was recorded -- if this")
+    print("    was actually a real trade you exited, use option 10 (Close) instead next time.")
+
+
 def close_position(portfolio):
     print("\n--- Close / Remove a Position ---")
     list_positions(portfolio)
@@ -316,6 +346,7 @@ def main():
     print("10: Close / remove an existing position")
     print("11: View current positions (no changes)")
     print("12: View realized P/L history (closed positions)")
+    print("13: REMOVE a mistaken entry (correction only -- no P/L logged)")
     print(" 0: Cancel / exit without saving")
     print("-" * 46)
     choice = input(" -> Select an option: ").strip()
@@ -345,6 +376,8 @@ def main():
             list_positions(portfolio)
         elif choice == "12":
             show_closed_positions(portfolio)
+        elif choice == "13":
+            remove_position_no_close(portfolio); save_portfolio(portfolio)
         elif choice == "0":
             print("Cancelled, no changes made.")
         else:

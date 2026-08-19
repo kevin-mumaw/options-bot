@@ -24,12 +24,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PORTFOLIO_FILE = "portfolio.json"
-# Sandbox provides the SAME real market data feed as production, just delayed the
-# industry-standard 15 minutes -- not simulated/fake data. Set TRADIER_SANDBOX=false in
-# .env once the Tradier account is funded and production access is restored. Delayed
-# data is a non-issue for this bot's actual use case (swing trades held for weeks, never
-# day-trading) -- see Algo-Aware Strategy Framework, "abandon execution speed."
-TRADIER_BASE_URL = "https://sandbox.tradier.com/v1" if os.getenv("TRADIER_SANDBOX", "true").lower() == "true" else "https://api.tradier.com/v1"
+# Live market data (quotes, expirations, option chains) comes from yfinance -- free,
+# no account/funding requirement, no OAuth token to babysit. Tradier (required a funded
+# brokerage account for production access) and Schwab (required a live browser login
+# every 7 days for its OAuth refresh token) were both tried and dropped for this reason.
+# Known tradeoff, carried over from the pre-Tradier era: Streamlit Cloud's shared IPs can
+# get rate-limited/blocked by Yahoo Finance. Not an issue for local desktop runs.
 
 # Liquid universe: top ~200 S&P 500 companies by market cap (covers nearly all Nasdaq 100
 # names too, since those are dominated by the same mega-caps) + the standard heavily-traded
@@ -255,50 +255,25 @@ def filter_liquid_universe(tickers, progress=print):
     per-ticker later in scan_single_ticker -- this stage only screens on price/volume."""
     liquid = []
     batch_size = 100
-    if DATA_SOURCE == "schwab":
-        try:
-            client = get_schwab_client()
-        except Exception as e:
-            progress(f" [!] Schwab client error: {e}")
-            return []
-        for i in range(0, len(tickers), batch_size):
-            batch = tickers[i:i + batch_size]
-            try:
-                resp = client.get_quotes(batch, fields=["quote", "fundamental"])
-                resp.raise_for_status()
-                data = resp.json()
-                for symbol, q in data.items():
-                    quote_node = q.get('quote', {})
-                    fundamental_node = q.get('fundamental', {})
-                    price = quote_node.get('lastPrice') or quote_node.get('mark') or 0
-                    avg_vol = (fundamental_node.get('avg10DaysVolume') or fundamental_node.get('avg1YearVolume')
-                               or quote_node.get('totalVolume') or 0)
-                    if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
-                        liquid.append(symbol)
-            except Exception as e:
-                progress(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
-        return liquid
-
-    token = os.getenv("TRADIER_API_KEY")
-    if not token:
-        return []
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         try:
-            res = requests.get(f"{TRADIER_BASE_URL}/markets/quotes",
-                                params={"symbols": ",".join(batch)},
-                                headers=headers, timeout=15).json()
-            quotes = (res.get('quotes') or {}).get('quote', [])
-            if isinstance(quotes, dict):
-                quotes = [quotes]
-            for q in quotes:
-                price = q.get('last') or 0
-                avg_vol = q.get('average_volume') or 0
-                if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
-                    liquid.append(q.get('symbol'))
+            hist = _yf_retry(lambda: yf.download(batch, period="1mo", group_by="ticker", progress=False,
+                                                   threads=True, auto_adjust=False))
         except Exception as e:
             progress(f" [!] Liquidity batch {i}-{i+batch_size}: {e}")
+            continue
+        for sym in batch:
+            try:
+                sub = hist[sym] if len(batch) > 1 else hist
+                if sub.empty or 'Close' not in sub or sub['Close'].dropna().empty:
+                    continue
+                price = sub['Close'].dropna().iloc[-1]
+                avg_vol = sub['Volume'].dropna().mean()
+                if price >= MIN_PRICE and avg_vol >= MIN_AVG_VOLUME:
+                    liquid.append(sym)
+            except Exception:
+                continue  # one bad symbol in a batch shouldn't drop the whole batch
     return liquid
 
 def load_portfolio():
@@ -436,6 +411,25 @@ def bs_put_price(spot, strike, iv, days_to_exp, div_yield=0.0):
     Nd2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
     return strike * (1 - Nd2) - fwd * (1 - Nd1)
 
+def bs_delta(spot, strike, iv, days_to_exp, option_type, div_yield=0.0):
+    """Black-Scholes delta (r=0, same conventions as bs_call_price/bs_put_price above).
+    yfinance's option chain has no greeks at all -- no delta, no per-leg IV beyond the
+    single `impliedVolatility` column -- so this estimates delta from that same IV rather
+    than leaving credit-spread strike selection (which filters by delta) with nothing to
+    work with. An estimate from the same model already used everywhere else in this file
+    for pricing/probability, not a real exchange-computed greek."""
+    if spot <= 0 or strike <= 0 or iv <= 0 or days_to_exp <= 0:
+        return None
+    T = days_to_exp / 365.0
+    fwd = spot * math.exp(-div_yield * T)
+    d1 = (math.log(fwd / strike) + 0.5 * iv * iv * T) / (iv * math.sqrt(T))
+    Nd1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    disc = math.exp(-div_yield * T)
+    if option_type == "call":
+        return disc * Nd1
+    else:
+        return disc * (Nd1 - 1)
+
 def estimate_spread_haircut(net_cost, *legs):
     """Estimates round-trip bid/ask friction as a fraction of net cost, from each leg's
     OWN currently-quoted spread width (ask - bid). Used to make 'exit price for target
@@ -449,6 +443,24 @@ def estimate_spread_haircut(net_cost, *legs):
     if net_cost <= 0:
         return 0.0
     return min(0.5, total_leg_spread / net_cost)
+
+
+def clamped_target_for_exit(target_value, spread_haircut, max_achievable_value):
+    """Applies the spread-haircut adjustment to a profit target (dividing by
+    1 - spread_haircut/2 to inflate it), then clamps the result below the position's own
+    maximum achievable BS-repriced value. Needed because that division has no ceiling:
+    at the haircut's 50% cap it ALWAYS inflates target_value by >33%, which is
+    mathematically guaranteed to exceed a capped position's max value whenever
+    target_value is already within ~75% of that max -- true of every 80%-of-target exit
+    calc by construction (target_value = cost + 0.8*max_profit is always >= 80% of the
+    cap). Confirmed live 2026-08-19: a cheap, deep-ITM META put vertical ($1.55 net debit,
+    $5 wide) had a combined leg spread wide enough to hit the 50% haircut cap, inflating
+    the exit target past the vertical's own $5 ceiling -- an unreachable target that made
+    exit_price_for_target's bisection search collapse to its outer search boundary
+    (spot*0.3) instead of finding a real root, reporting a nonsense $163 'exit price'.
+    Clamping to 99% of the max leaves the solver a real root to converge to."""
+    adjusted = target_value / (1 - spread_haircut / 2)
+    return min(adjusted, max_achievable_value * 0.99)
 
 
 def exit_price_caveat(exit_price, spot, threshold=0.12):
@@ -808,138 +820,109 @@ def detect_regime(ticker, current_iv, price_history=None):
         "rsi_divergence": rsi_divergence,
     }
 
-DATA_SOURCE = os.getenv("DATA_SOURCE", "tradier").lower()  # "tradier" or "schwab"
-
-_schwab_client_cache = None
-
-
-def get_schwab_client():
-    """Cached Schwab client using the existing token.json/app key/secret setup already
-    working in weekly-options-signal-engine. Requires SCHWAB_APP_KEY, SCHWAB_APP_SECRET,
-    and SCHWAB_TOKEN_PATH (defaults to ./token.json) in .env."""
-    global _schwab_client_cache
-    if _schwab_client_cache is not None:
-        return _schwab_client_cache
-    from schwab.auth import client_from_token_file
-    api_key = os.getenv("SCHWAB_APP_KEY")
-    app_secret = os.getenv("SCHWAB_APP_SECRET")
-    token_path = os.getenv("SCHWAB_TOKEN_PATH", "./token.json")
-    if not api_key or not app_secret:
-        raise RuntimeError("SCHWAB_APP_KEY / SCHWAB_APP_SECRET not set in .env")
-    _schwab_client_cache = client_from_token_file(token_path, api_key, app_secret, enforce_enums=False)
-    return _schwab_client_cache
-
-
-def _schwab_option_to_tradier_shape(contract, option_type):
-    """Reshapes one Schwab option-chain contract into the exact dict shape Tradier's
-    /markets/options/chains endpoint returns, so every downstream parser in this file
-    (which expects opt.get('bid'), opt.get('open_interest'), opt.get('greeks',{}).get(
-    'mid_iv')/'delta', opt.get('strike'), opt.get('option_type')) keeps working
-    unmodified regardless of which data source is active."""
-    return {
-        'strike': contract.get('strikePrice'),
-        'option_type': option_type,
-        'bid': contract.get('bid') or 0,
-        'ask': contract.get('ask') or 0,
-        'open_interest': contract.get('openInterest') or 0,
-        'greeks': {
-            'mid_iv': (contract.get('volatility') or 0) / 100.0,  # Schwab reports as a
-            # percentage (23.4 == 23.4%), Tradier's mid_iv is already decimal -- verified
-            # against a live PEP comparison 2026-07-23, not guessed.
-            'delta': contract.get('delta'),
-        },
-    }
-
-
-def get_schwab_quote(symbol):
-    """Returns {'last': float, 'average_volume': float} matching the fields this file
-    actually reads off a Tradier quote dict. average_volume comes from Schwab's
-    'fundamental' data node -- field name UNVERIFIED against a live response (schwab-py's
-    own docs decline to document option-chain/fundamental fields in detail). Falls back
-    to 0 if the field isn't where expected, which will simply exclude that ticker from
-    the liquidity filter rather than crash -- flagged here so it's easy to find and fix
-    if liquidity filtering behaves oddly on Schwab."""
-    client = get_schwab_client()
-    resp = client.get_quote(symbol, fields=["quote", "fundamental"])
-    resp.raise_for_status()
-    data = resp.json()
-    q = data.get(symbol, {})
-    quote_node = q.get('quote', {})
-    fundamental_node = q.get('fundamental', {})
-    avg_vol = (fundamental_node.get('avg10DaysVolume') or fundamental_node.get('avg1YearVolume')
-               or quote_node.get('totalVolume') or 0)  # last resort: today's volume, not a true average
-    return {
-        'last': quote_node.get('lastPrice') or quote_node.get('mark') or 0,
-        'average_volume': avg_vol,
-        'symbol': symbol,
-    }
-
-
-def get_schwab_chain_raw(symbol, expiration):
-    """Returns a flat list of option dicts (Tradier-shaped) for one expiration."""
-    client = get_schwab_client()
-    exp_date_obj = datetime.strptime(expiration, "%Y-%m-%d").date()
-    resp = client.get_option_chain(symbol, from_date=exp_date_obj, to_date=exp_date_obj)
-    resp.raise_for_status()
-    data = resp.json()
-    options = []
-    for side_key, opt_type in (("callExpDateMap", "call"), ("putExpDateMap", "put")):
-        exp_map = data.get(side_key, {})
-        for exp_key, strikes in exp_map.items():
-            for strike_str, contracts in strikes.items():
-                if contracts:
-                    options.append(_schwab_option_to_tradier_shape(contracts[0], opt_type))
-    return options
-
-
-def get_schwab_expirations(symbol):
-    """Returns a sorted list of expiration date strings ('YYYY-MM-DD') available for
-    this ticker, pulled from a wide unfiltered option-chain call."""
-    client = get_schwab_client()
-    resp = client.get_option_chain(symbol)
-    resp.raise_for_status()
-    data = resp.json()
-    dates = set()
-    for side_key in ("callExpDateMap", "putExpDateMap"):
-        for exp_key in data.get(side_key, {}):
-            dates.add(exp_key.split(":")[0])
-    return sorted(dates)
-
-
-def get_tradier_quote(symbol, headers):
-    if DATA_SOURCE == "schwab":
+def _yf_retry(fn, max_retries=3, base_delay=2.0):
+    """Runs fn() with retry-with-backoff, but ONLY for rate-limit errors -- yfinance
+    routes Yahoo's HTTP 429 through as a plain Exception with 'Too Many Requests' (or
+    'Rate limit') in the message, not a distinct exception type, so that's the only
+    reliable way to detect it here. Any other exception (bad ticker, no data, network
+    blip) re-raises immediately -- retrying those would just waste time on a failure
+    that backoff can't fix. Needed because scanning 200+ tickers through a 15-thread
+    pool, each doing several yfinance calls, throws a burst of requests at Yahoo well
+    above what a single IP can sustain -- confirmed live 2026-08-19, dozens of tickers
+    silently dropped from a scan to 'Too Many Requests' errors. Exponential backoff
+    (2s, 4s, 8s) plus jitter (so 15 threads don't all retry in lockstep and re-trigger
+    the same limit) gives Yahoo's short-lived throttle window a chance to clear."""
+    last_exc = None
+    for attempt in range(max_retries):
         try:
-            q = get_schwab_quote(symbol)
-            return {'last': q['last'], 'average_volume': q['average_volume'], 'symbol': symbol}
-        except Exception:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            msg = str(e).lower()
+            if "too many requests" not in msg and "rate limit" not in msg and "429" not in msg:
+                raise
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt) + random.uniform(0, 1))
+    raise last_exc
+
+def get_tradier_quote(symbol, headers=None):
+    """Returns {'last': float, 'average_volume': float, 'symbol': str} via yfinance.
+    Name kept as `get_tradier_quote` (and `headers` kept as a no-op param) so every
+    existing call site across this file didn't need touching when the data source
+    changed -- there is no Tradier/Schwab involved here anymore, both required either a
+    funded brokerage account or a browser re-login every 7 days, and got dropped for it."""
+    try:
+        tk = yf.Ticker(symbol)
+        hist = _yf_retry(lambda: tk.history(period="5d"))
+        if hist.empty or 'Close' not in hist or hist['Close'].dropna().empty:
             return None
-    res = requests.get(f"{TRADIER_BASE_URL}/markets/quotes",
-                        params={"symbols": symbol}, headers=headers, timeout=10).json()
-    q = (res.get('quotes') or {}).get('quote')
-    if isinstance(q, list):
-        q = q[0] if q else None
-    return q
+        last = float(hist['Close'].dropna().iloc[-1])
+        avg_vol = float(hist['Volume'].dropna().mean()) if 'Volume' in hist and not hist['Volume'].dropna().empty else 0.0
+        return {'last': last, 'average_volume': avg_vol, 'symbol': symbol}
+    except Exception:
+        return None
 
-def get_tradier_chain(symbol, expiration, headers):
-    if DATA_SOURCE == "schwab":
-        try:
-            return get_schwab_chain_raw(symbol, expiration)
-        except Exception:
-            return []
-    res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
-                        params={"symbol": symbol, "expiration": expiration},
-                        headers=headers, timeout=10).json()
-    options = (res.get('options') or {}).get('option', [])
-    if isinstance(options, dict):
-        options = [options]
+def get_tradier_chain(symbol, expiration, headers=None):
+    """Returns a flat list of option dicts (same shape this file has always parsed:
+    strike/option_type/bid/ask/open_interest/greeks{mid_iv,delta}) for one expiration,
+    via yfinance. yfinance has no greeks -- delta is estimated with bs_delta() from the
+    chain's own impliedVolatility, spot, and days-to-expiration (see bs_delta docstring)."""
+    try:
+        tk = yf.Ticker(symbol)
+        chain = _yf_retry(lambda: tk.option_chain(expiration))
+    except Exception:
+        return []
+    try:
+        hist = _yf_retry(lambda: tk.history(period="5d"))
+        spot = float(hist['Close'].dropna().iloc[-1]) if not hist.empty and not hist['Close'].dropna().empty else None
+    except Exception:
+        spot = None
+    days_to_exp = (datetime.strptime(expiration, "%Y-%m-%d") - datetime.now()).days
+    div_yield = get_dividend_yield(symbol)
+    options = []
+    for df, opt_type in ((chain.calls, "call"), (chain.puts, "put")):
+        for _, row in df.iterrows():
+            iv = row.get('impliedVolatility') or 0
+            # yfinance returns a near-zero placeholder (commonly ~0.00001) instead of a
+            # real IV for contracts it couldn't back out a fresh value for -- still
+            # technically truthy/nonzero, so it silently slips past every downstream
+            # `iv or 0.35`-style fallback that was written expecting missing IV to show up
+            # as 0/None. Fed into Black-Scholes as-is, a near-zero IV collapses the option
+            # to pure intrinsic value with an almost-vertical kink at the strike, which
+            # broke exit_price_for_target's bisection search on real scans (produced
+            # nonsense exit/stop prices like $163 on a $505/$510 vertical -- confirmed
+            # 2026-08-19). Treat anything below 1% as "no real IV available" so it falls
+            # through to the same 0.35 default every other missing-data path already uses.
+            if iv < 0.01:
+                iv = None
+            delta = None
+            if spot and iv and days_to_exp > 0:
+                try:
+                    delta = bs_delta(spot, row['strike'], iv, days_to_exp, opt_type, div_yield)
+                except Exception:
+                    delta = None
+            options.append({
+                'strike': row.get('strike'),
+                'option_type': opt_type,
+                'bid': row.get('bid') or 0,
+                'ask': row.get('ask') or 0,
+                'open_interest': row.get('openInterest') or 0,
+                'greeks': {'mid_iv': iv, 'delta': delta},
+            })
     return options
+
+def get_yfinance_expirations(symbol):
+    """Returns the sorted list of expiration date strings ('YYYY-MM-DD') yfinance has
+    for this ticker."""
+    try:
+        return sorted(_yf_retry(lambda: yf.Ticker(symbol).options))
+    except Exception:
+        return []
 
 def track_live_portfolio():
     portfolio = load_portfolio()
     if not portfolio: return f"\n[!] Configuration file '{PORTFOLIO_FILE}' not found or is empty."
-    token = os.getenv("TRADIER_API_KEY")
-    if DATA_SOURCE != "schwab" and not token: return "\n[!] TRADIER_API_KEY not set -- can't pull live prices."
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
+    headers = {}  # no-op, kept only because get_tradier_quote/get_tradier_chain still take it positionally
     report = "\n" + "═"*60 + "\n          LIVE OPTIONS PORTFOLIO RISK TRACKER\n" + "═"*60 + "\n"
     if portfolio.get("butterfly_spreads"):
         report += "─── ACTIVE BUTTERFLY SPREADS ───\n"
@@ -999,10 +982,7 @@ def get_portfolio_status():
     portfolio = load_portfolio()
     if not portfolio:
         return {"error": f"Configuration file '{PORTFOLIO_FILE}' not found or is empty."}
-    token = os.getenv("TRADIER_API_KEY")
-    if DATA_SOURCE != "schwab" and not token:
-        return {"error": "TRADIER_API_KEY not set -- can't pull live prices."}
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
+    headers = {}  # no-op, kept only because get_tradier_quote/get_tradier_chain still take it positionally
     positions = []
 
     for bfly in portfolio.get("butterfly_spreads", []):
@@ -1279,32 +1259,21 @@ def generate_narrative(pos):
     return " ".join(lines)
 
 def scan_single_ticker(ticker):
-    """Pulls option chains (Tradier or Schwab, per DATA_SOURCE), detects the ticker's
-    regime (trend + IV richness), and dispatches to the strategy that regime calls for:
-    bull call verticals in an uptrend, bear put verticals in a downtrend, butterflies
-    when neutral."""
+    """Pulls option chains (yfinance), detects the ticker's regime (trend + IV
+    richness), and dispatches to the strategy that regime calls for: bull call
+    verticals in an uptrend, bear put verticals in a downtrend, butterflies when
+    neutral."""
     setups = []
-    token = os.getenv("TRADIER_API_KEY")
-    if DATA_SOURCE != "schwab" and not token: return setups
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"} if token else {}
+    headers = {}  # no-op, kept only because get_tradier_chain still takes it positionally
 
     try:
         # Spot price
-        spot_hist = yf.Ticker(ticker).history(period="5d")
+        spot_hist = _yf_retry(lambda: yf.Ticker(ticker).history(period="5d"))
         if spot_hist.empty: return setups
         spot = spot_hist['Close'].iloc[-1]
 
         # 1. Get available expirations for this ticker, pick the one 30-75 days out
-        if DATA_SOURCE == "schwab":
-            try:
-                expirations = get_schwab_expirations(ticker)
-            except Exception:
-                expirations = []
-        else:
-            exp_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/expirations",
-                                    params={"symbol": ticker}, headers=headers, timeout=10).json()
-            expirations = (exp_res.get('expirations') or {}).get('date', [])
-            if isinstance(expirations, str): expirations = [expirations]
+        expirations = get_yfinance_expirations(ticker)
         if not expirations: return setups
 
         target_date = get_macro_expiration(expirations)
@@ -1407,7 +1376,7 @@ def scan_single_ticker(ticker):
                     "expiration": target_date, "spot_at_scan": spot, "strike": strike,
                     "net_cost": cost, "max_profit": assumed_payoff, "jump_adjusted": jump_adjusted,
                     "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
-                    "desc": f"[BULLISH/CHEAP IV] BUY ${strike} C (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (NOTE: calls have theoretically unlimited upside -- this is a realistic target, not a hard cap) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
+                    "desc": f"[BULLISH/CHEAP IV] BUY ${strike} C (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (NOTE: calls have theoretically unlimited upside -- this is a realistic target, not a hard cap) | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock drops that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | ⚠ EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
                 })
 
         elif trend == "bullish" and regime["iv_regime"] == "rich" and not atm_puts.empty:
@@ -1461,7 +1430,7 @@ def scan_single_ticker(ticker):
                     ev = prob_profit * max_profit - (1 - prob_profit) * net_debit
                     target_value = net_debit + 0.8 * max_profit
                     spread_haircut = estimate_spread_haircut(net_debit, long_leg, short_leg)
-                    target_value_for_exit = target_value / (1 - spread_haircut / 2)
+                    target_value_for_exit = clamped_target_for_exit(target_value, spread_haircut, net_debit + max_profit)
                     exit_price = exit_price_for_target(
                         "up",
                         lambda S: bs_call_price(S, long_leg['strike'], avg_iv, days_to_exp, div_yield)
@@ -1511,7 +1480,7 @@ def scan_single_ticker(ticker):
                 true_max_profit = strike - cost  # if the stock went to literally $0 -- not realistic, but the actual hard cap
                 target_value = cost + 0.8 * assumed_payoff
                 spread_haircut = estimate_spread_haircut(cost, leg_row)
-                target_value_for_exit = target_value / (1 - spread_haircut / 2)
+                target_value_for_exit = clamped_target_for_exit(target_value, spread_haircut, strike)
                 exit_price = exit_price_for_target(
                     "down", lambda S: bs_put_price(S, strike, avg_iv, days_to_exp, div_yield),
                     spot, target_value_for_exit
@@ -1527,7 +1496,7 @@ def scan_single_ticker(ticker):
                     "expiration": target_date, "spot_at_scan": spot, "strike": strike,
                     "net_cost": cost, "max_profit": assumed_payoff, "jump_adjusted": jump_adjusted,
                     "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
-                    "desc": f"[BEARISH/CHEAP IV] BUY ${strike} P (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Max Theoretical Profit: ${true_max_profit:.2f} (only if stock->$0 -- unrealistic) | Realistic Target Profit @ ~1SD move: ${assumed_payoff:.2f} | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
+                    "desc": f"[BEARISH/CHEAP IV] BUY ${strike} P (Cost: ${cost:.2f}) | Breakeven: ${breakeven:.2f} | Max Loss: ${cost:.2f} (100% of premium) | Max Theoretical Profit: ${true_max_profit:.2f} (only if stock->$0 -- unrealistic) | Realistic Target Profit @ ~1SD move: ${assumed_payoff:.2f} | Exit near ${exit_price:.2f}{exit_price_caveat(exit_price, spot)} to capture ~80% of target | Stop-Loss near ${stop_price:.2f} if stock rises that far (cuts the loss at {STOP_LOSS_PCT*100:.0f}% of premium rather than riding to zero){stop_loss_caveat()} | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}%{' [jump-adjusted -- uses historical earnings-day moves, not IV]' if jump_adjusted else ''} | EV: ${ev:+.2f}{(' | ⚠ EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
                 })
 
         elif trend == "bearish" and regime["iv_regime"] == "rich" and not atm_calls.empty:
@@ -1581,7 +1550,7 @@ def scan_single_ticker(ticker):
                     ev = prob_profit * max_profit - (1 - prob_profit) * net_debit
                     target_value = net_debit + 0.8 * max_profit
                     spread_haircut = estimate_spread_haircut(net_debit, long_leg, short_leg)
-                    target_value_for_exit = target_value / (1 - spread_haircut / 2)
+                    target_value_for_exit = clamped_target_for_exit(target_value, spread_haircut, net_debit + max_profit)
                     exit_price = exit_price_for_target(
                         "down",
                         lambda S: bs_put_price(S, long_leg['strike'], avg_iv, days_to_exp, div_yield)
@@ -1641,7 +1610,7 @@ def scan_single_ticker(ticker):
                         "expiration": target_date, "spot_at_scan": spot, "strike": straddle_strike,
                         "net_cost": net_cost, "max_profit": assumed_payoff,
                         "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
-                        "desc": f"[NEUTRAL/CHEAP IV] BUY ${straddle_strike} C + BUY ${straddle_strike} P (Cost: ${net_cost:.2f}) | Breakevens: ${breakeven_down:.2f} / ${breakeven_up:.2f} | Max Loss: ${net_cost:.2f} (capped, if stock pins exactly at ${straddle_strike}) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (uncapped upside, no clean 80%-exit price since both legs move together) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
+                        "desc": f"[NEUTRAL/CHEAP IV] BUY ${straddle_strike} C + BUY ${straddle_strike} P (Cost: ${net_cost:.2f}) | Breakevens: ${breakeven_down:.2f} / ${breakeven_up:.2f} | Max Loss: ${net_cost:.2f} (capped, if stock pins exactly at ${straddle_strike}) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (uncapped upside, no clean 80%-exit price since both legs move together) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{(' | ⚠ EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
                     })
 
             # Long strangle: nearest OTM call above spot, nearest OTM put below spot
@@ -1672,7 +1641,7 @@ def scan_single_ticker(ticker):
                         "call_strike": call_leg['strike'], "put_strike": put_leg['strike'],
                         "net_cost": net_cost, "max_profit": assumed_payoff,
                         "iv_rv_ratio": regime.get("iv_rv_ratio"), "earnings_in_window": regime.get("earnings_in_window"),
-                        "desc": f"[NEUTRAL/CHEAP IV] BUY ${call_leg['strike']} C + BUY ${put_leg['strike']} P (Cost: ${net_cost:.2f}) | Breakevens: ${breakeven_down:.2f} / ${breakeven_up:.2f} | Max Loss: ${net_cost:.2f} (capped, if stock finishes between the two strikes) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (uncapped upside, no clean 80%-exit price since both legs move together) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{(' | \u26a0 EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
+                        "desc": f"[NEUTRAL/CHEAP IV] BUY ${call_leg['strike']} C + BUY ${put_leg['strike']} P (Cost: ${net_cost:.2f}) | Breakevens: ${breakeven_down:.2f} / ${breakeven_up:.2f} | Max Loss: ${net_cost:.2f} (capped, if stock finishes between the two strikes) | Target Profit @ ~1SD move: ${assumed_payoff:.2f} (uncapped upside, no clean 80%-exit price since both legs move together) | Exp: {target_date} | Est. Prob. of Profit: {prob_profit*100:.0f}% | EV: ${ev:+.2f}{(' | ⚠ EARNINGS IN RV WINDOW' if regime.get('earnings_in_window') else '')}{divergence_tag}"
                     })
 
         elif trend == "neutral" and regime["iv_regime"] == "rich" and not atm_calls.empty and not atm_puts.empty:
@@ -1724,7 +1693,7 @@ def scan_single_ticker(ticker):
                         ev = prob_profit * max_bfly_profit - (1 - prob_profit) * net_cost
                         target_value = net_cost + 0.8 * max_bfly_profit
                         spread_haircut = estimate_spread_haircut(net_cost, low_leg, mid_leg, mid_leg, high_leg)
-                        target_value_for_search = target_value / (1 - spread_haircut / 2)
+                        target_value_for_search = clamped_target_for_exit(target_value, spread_haircut, wing_width)
 
                         def _bfly_value(S, _low=low_leg['strike'], _mid=mid_leg['strike'], _high=high_leg['strike'], _iv=avg_iv, _dte=days_to_exp, _dy=div_yield):
                             return (bs_call_price(S, _low, _iv, _dte, _dy) + bs_call_price(S, _high, _iv, _dte, _dy)
@@ -1846,7 +1815,13 @@ def run_bulk_screener(progress=print, return_setups=False):
         msg = "No tickers passed the liquidity filter -- check your Tradier connection or thresholds."
         return (msg, {}) if return_setups else msg
     progress(f" [*] Scanning {len(liquid_tickers)} liquid tickers for options setups via parallel multithreading pools...")
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    # Lowered from 15 -- yfinance has no API key/account tier to throttle against, just
+    # Yahoo's shared-IP rate limit, and 15 threads each firing several yfinance calls per
+    # ticker threw a burst well above what one IP can sustain (confirmed live 2026-08-19:
+    # dozens of tickers dropped to "Too Many Requests" mid-scan). Combined with the
+    # retry-with-backoff in _yf_retry, a smaller pool trades some wall-clock time for
+    # actually finishing the scan instead of silently losing tickers to the rate limit.
+    with ThreadPoolExecutor(max_workers=6) as executor:
         results = executor.map(scan_single_ticker, liquid_tickers)
     for res_list in results:
         if res_list: all_setups.extend(res_list)

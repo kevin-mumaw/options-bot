@@ -6,7 +6,6 @@ Usage:  python diagnose_scan.py SPY
 """
 import sys
 import os
-import requests
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
@@ -14,16 +13,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TRADIER_BASE_URL = "https://api.tradier.com/v1"
-
 ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
-token = os.getenv("TRADIER_API_KEY")
 print(f"--- Diagnosing {ticker} ---")
-print(f"Tradier key loaded: {'yes' if token else 'NO — check TRADIER_API_KEY in .env'}")
-if not token:
-    sys.exit(1)
-
-headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+print("Data source: yfinance (no key/account required).")
 
 # 1. Spot price
 spot_hist = yf.Ticker(ticker).history(period="5d")
@@ -34,18 +26,16 @@ spot = spot_hist['Close'].iloc[-1]
 print(f"Spot price: ${spot:.2f}")
 
 # 2. Expirations
-exp_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/expirations",
-                        params={"symbol": ticker}, headers=headers, timeout=10).json()
-print(f"Raw expirations response keys: {list(exp_res.keys())}")
-expirations = (exp_res.get('expirations') or {}).get('date', [])
-if isinstance(expirations, str):
-    expirations = [expirations]
+try:
+    expirations = sorted(yf.Ticker(ticker).options)
+except Exception as e:
+    print(f"STOP: yfinance raised an error fetching expirations: {e}")
+    sys.exit(1)
 print(f"Expirations returned: {len(expirations)}")
 print(f"First few: {expirations[:8]}")
 
 if not expirations:
-    print("STOP: Tradier returned no expirations at all for this ticker.")
-    print(f"Full response: {exp_res}")
+    print("STOP: yfinance returned no expirations at all for this ticker.")
     sys.exit(1)
 
 current_date = datetime.now()
@@ -79,33 +69,27 @@ if not target_date:
     sys.exit(1)
 
 # 3. Option chain
-chain_res = requests.get(f"{TRADIER_BASE_URL}/markets/options/chains",
-                          params={"symbol": ticker, "expiration": target_date, "greeks": "true"},
-                          headers=headers, timeout=10).json()
-print(f"Raw chain response keys: {list(chain_res.keys())}")
-options = (chain_res.get('options') or {}).get('option', [])
-if isinstance(options, dict):
-    options = [options]
-print(f"Total contracts (calls+puts) returned: {len(options)}")
+try:
+    chain = yf.Ticker(ticker).option_chain(target_date)
+except Exception as e:
+    print(f"STOP: yfinance raised an error fetching the chain: {e}")
+    sys.exit(1)
+print(f"Total contracts (calls+puts) returned: {len(chain.calls) + len(chain.puts)}")
 
-if not options:
-    print("STOP: Tradier returned no contracts for this expiration.")
-    print(f"Full response: {chain_res}")
+if chain.calls.empty and chain.puts.empty:
+    print("STOP: yfinance returned no contracts for this expiration.")
     sys.exit(1)
 
-calls_raw = [o for o in options if o.get('option_type') == 'call']
-print(f"Calls only: {len(calls_raw)}")
+print(f"Calls only: {len(chain.calls)}")
 
 contracts_list = []
-for opt in calls_raw:
-    greeks = opt.get('greeks') or {}
-    iv = greeks.get('mid_iv') or greeks.get('smv_vol') or 0.35
+for _, opt in chain.calls.iterrows():
     contracts_list.append({
         'strike': opt.get('strike'),
         'bid': opt.get('bid') or 0,
         'ask': opt.get('ask') or 0,
-        'openInterest': opt.get('open_interest') or 0,
-        'impliedVolatility': iv
+        'openInterest': opt.get('openInterest') or 0,
+        'impliedVolatility': opt.get('impliedVolatility') or 0.35
     })
 
 calls = pd.DataFrame(contracts_list)

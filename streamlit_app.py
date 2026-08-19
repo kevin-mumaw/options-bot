@@ -12,37 +12,14 @@ import os
 import streamlit as st
 
 # On Streamlit Community Cloud, secrets come from st.secrets (set in the app dashboard),
-# not from a .env file. We copy it into the environment BEFORE importing options_bot,
-# so os.getenv("TRADIER_API_KEY") works the same way locally and when deployed.
-# Locally there's no secrets.toml at all (options_bot.py reads .env directly instead),
-# and st.secrets raises if the file is completely missing -- not just if a key is absent
-# -- so this whole block is wrapped defensively for local runs.
+# not from a .env file. We copy PORTFOLIO_JSON into the environment BEFORE importing
+# options_bot, since that's the only secret this app still needs -- live market data now
+# comes from yfinance (no key/account required at all, see options_bot.py). Locally
+# there's no secrets.toml at all, and st.secrets raises if the file is completely missing
+# -- not just if a key is absent -- so this is wrapped defensively for local runs.
 try:
-    if "TRADIER_API_KEY" in st.secrets:
-        os.environ["TRADIER_API_KEY"] = st.secrets["TRADIER_API_KEY"]
-    if "TRADIER_SANDBOX" in st.secrets:
-        os.environ["TRADIER_SANDBOX"] = st.secrets["TRADIER_SANDBOX"]
     if "PORTFOLIO_JSON" in st.secrets:
         os.environ["PORTFOLIO_JSON"] = st.secrets["PORTFOLIO_JSON"]
-    if "DATA_SOURCE" in st.secrets:
-        os.environ["DATA_SOURCE"] = st.secrets["DATA_SOURCE"]
-    if "SCHWAB_APP_KEY" in st.secrets:
-        os.environ["SCHWAB_APP_KEY"] = st.secrets["SCHWAB_APP_KEY"]
-    if "SCHWAB_APP_SECRET" in st.secrets:
-        os.environ["SCHWAB_APP_SECRET"] = st.secrets["SCHWAB_APP_SECRET"]
-    if "SCHWAB_TOKEN_JSON" in st.secrets:
-        # Streamlit Cloud has NO persistent local disk -- token.json can't just live
-        # there as a file the way it does on your desktop. Instead, the token's raw
-        # JSON content lives in this secret, and gets written out to a temp file on
-        # every app startup so options_bot.py's normal file-based token loading works
-        # unmodified. NOTE: this does NOT solve token refresh -- the 7-day-expiring
-        # token still has to be regenerated on your desktop and this secret's value
-        # updated manually each time, same as PORTFOLIO_JSON already requires.
-        import tempfile
-        token_path = os.path.join(tempfile.gettempdir(), "schwab_token.json")
-        with open(token_path, "w") as f:
-            f.write(st.secrets["SCHWAB_TOKEN_JSON"])
-        os.environ["SCHWAB_TOKEN_PATH"] = token_path
 except Exception:
     pass  # no secrets.toml -- fine locally, .env covers it
 

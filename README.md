@@ -2,8 +2,13 @@
 
 A liquid-universe options screener and portfolio P/L tracker, with a desktop CLI and a
 mobile-friendly Streamlit web view. All live market data (quotes, expirations, option
-chains) comes from Tradier -- both the screener and the portfolio tracker use it, since
-Streamlit Cloud's shared IPs get rate-limited/blocked by Yahoo Finance.
+chains) comes from yfinance -- both the screener and the portfolio tracker use it. Free,
+no account/funding/OAuth required. History: this project tried Tradier (required a
+funded brokerage account for production API access, sandbox-only otherwise) and Schwab
+(required a live browser login every 7 days to refresh its OAuth token) before landing
+back on yfinance. Known tradeoff: Streamlit Cloud's shared IPs can get rate-limited/
+blocked by Yahoo Finance -- a real risk for the mobile deploy, not an issue for local
+desktop runs.
 
 ## What it does
 
@@ -100,10 +105,8 @@ forward-test shows promise and you want to validate faster / further back.
 ## Setup
 
 1. `pip install -r requirements.txt`
-2. Create a `.env` file (not committed) with:
-   ```
-   TRADIER_API_KEY=your_key_here
-   ```
+2. No API key/account needed -- live data comes from yfinance. A `.env` file is only
+   needed if you use `GITHUB_TOKEN`/`GITHUB_REPO` (mobile backtest-log sync, see below).
 3. Create `portfolio.json` locally (not committed) with your open positions -- see
    `log_trade.py` to add them interactively instead of hand-writing JSON. Supported
    sections: `butterfly_spreads`, `bullish_debit_spreads`, `bearish_debit_spreads`,
@@ -130,10 +133,10 @@ committed. Instead, positions live in Streamlit's private Secrets.
 4. Repository: this repo. Branch: `main`. Main file path: `streamlit_app.py`.
 5. In the app's **Settings -> Secrets**, add:
    ```
-   TRADIER_API_KEY = "your_key_here"
    PORTFOLIO_JSON = '{"butterfly_spreads": [...], "bullish_debit_spreads": [...], "bearish_debit_spreads": [...], "long_calls": [...], "long_puts": [...]}'
    ```
-   (paste your real portfolio.json contents as a single-line JSON string for the second one)
+   (paste your real portfolio.json contents as a single-line JSON string -- no API key
+   needed, live data comes from yfinance with no account/auth required)
 6. Open the deployed URL from your phone.
 
 Whenever you open/close a position with `log_trade.py` on your desktop, also update the
